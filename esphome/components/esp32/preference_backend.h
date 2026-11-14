@@ -4,6 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+namespace esphome::storage {
+class KeyValueStorage;
+}
+#endif
+
 namespace esphome::esp32 {
 
 class ESP32PreferenceBackend final {
@@ -11,6 +17,9 @@ class ESP32PreferenceBackend final {
   bool save(const uint8_t *data, size_t len);
   bool load(uint8_t *data, size_t len);
 
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  storage::KeyValueStorage *kv{nullptr};
+#endif
   uint32_t key{0};
   uint32_t nvs_handle{0};   // NVS (flash) path
   uint16_t rtc_offset{0};   // RTC path: word offset into the RTC storage region
