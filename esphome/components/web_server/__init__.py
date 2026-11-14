@@ -188,8 +188,6 @@ WebServer = web_server_ns.class_("WebServer", cg.Component)
 WebServerFileApi = web_server_ns.class_("WebServerFileApi", cg.Component)
 WebServerRawApi = web_server_ns.class_("WebServerRawApi", cg.Component)
 FileExplorerAssets = web_server_ns.class_("FileExplorerAssets", cg.Component)
-WebServerPackageApi = web_server_ns.class_("WebServerPackageApi", cg.Component)
-WebServerPublishingApi = web_server_ns.class_("WebServerPublishingApi", cg.Component)
 
 sorting_groups = {}
 
@@ -715,18 +713,6 @@ def _final_validate(config: ConfigType) -> None:
 FINAL_VALIDATE_SCHEMA = _final_validate
 
 
-ENTITY_TABLE_WRAP_SCRIPT = (
-    "<script>customElements.whenDefined('esp-entity-table').then(()=>{"
-    "const s=new CSSStyleSheet();"
-    "s.replaceSync('.entity-row>:nth-child(3){min-width:0;overflow-wrap:anywhere}');"
-    "customElements.get('esp-entity-table').elementStyles.push(s);"
-    "const a=document.querySelector('esp-app');"
-    "(a&&a.shadowRoot?a.shadowRoot.querySelectorAll('esp-entity-table'):[]).forEach(t=>{"
-    "if(t.shadowRoot)t.shadowRoot.adoptedStyleSheets=[...t.shadowRoot.adoptedStyleSheets,s];});"
-    "})</script>"
-)
-
-
 def build_index_html(config: ConfigType) -> str:
     html = "<!DOCTYPE html><html><head><meta charset=UTF-8><link rel=icon href=data:>"
     css_include = config.get(CONF_CSS_INCLUDE)
@@ -739,8 +725,6 @@ def build_index_html(config: ConfigType) -> str:
     if js_include:
         html += "<script type=module src=/0.js></script>"
     html += "<esp-app></esp-app>"
-    if config[CONF_VERSION] == 3:
-        html += ENTITY_TABLE_WRAP_SCRIPT
     if (browser := config.get(CONF_FILE_BROWSER)) is not None:
         if browser.get(CONF_VARIANT) == BROWSER_ADVANCED:
             # Only the scripts go here. The adapter builds the card and mounts it into the v3
@@ -760,22 +744,10 @@ def build_index_html(config: ConfigType) -> str:
             # Injected module renders a "Files" card inside this same page (next to
             # <esp-app>).
             html += "<script src=/file_browser.js></script>"
-    if _package_card(config):
-        html += "<script src=/packages/card.js></script>"
-    if _publishing_card(config):
-        html += "<script src=/publishing/card.js></script>"
     if config[CONF_JS_URL]:
         html += f'<script src="{config[CONF_JS_URL]}"></script>'
     html += "</body></html>"
     return html
-
-
-def _package_card(config: ConfigType) -> bool:
-    return config[CONF_VERSION] == 3 and "package_manager" in CORE.config
-
-
-def _publishing_card(config: ConfigType) -> bool:
-    return config[CONF_VERSION] == 3 and CORE.is_esp32
 
 
 def add_resource_as_progmem(
@@ -784,7 +756,7 @@ def add_resource_as_progmem(
     """Add a resource to progmem."""
     content_encoded = content.encode("utf-8")
     if compress:
-        content_encoded = gzip.compress(content_encoded, mtime=0)
+        content_encoded = gzip.compress(content_encoded)
     cg.extern_progmem_array(
         f"ESPHOME_WEBSERVER_{resource_name}", cg.uint8, list(content_encoded)
     )
@@ -823,7 +795,7 @@ def _flash_row(here: Path, rel: str, url: str, ctype: str, compress: bool) -> st
     """Compiles one asset in and returns its table row."""
     data = (here / rel).read_bytes()
     if compress:
-        data = gzip.compress(data, 9, mtime=0)
+        data = gzip.compress(data, 9)
     symbol = _asset_symbol(Path(rel).name)
     add_bytes_as_progmem(symbol, data)
     return (
@@ -1096,33 +1068,6 @@ async def to_code(config: ConfigType) -> None:
         cg.add(raw_var.set_enable_write(raw_api_config[CONF_ENABLE_WRITE]))
         if device_id := raw_api_config.get(CONF_DEVICE_ID):
             cg.add(raw_var.set_scoped_device(await cg.get_variable(device_id)))
-
-    if _package_card(config):
-        cg.add_define("USE_WEBSERVER_PACKAGE_API")
-        pkg_id = ID(f"{var}_package_api", is_declaration=True, type=WebServerPackageApi)
-        CORE.component_ids.add(str(pkg_id))
-        pkg_var = cg.new_Pvariable(pkg_id)
-        await cg.register_component(pkg_var, {})
-        cg.add(pkg_var.set_web_server_base(paren))
-        cg.add(
-            pkg_var.set_package_manager(
-                await cg.get_variable(CORE.config["package_manager"][CONF_ID])
-            )
-        )
-        js_path = Path(__file__).parent / "packages_card.js"
-        with js_path.open(encoding="utf-8") as js_file:
-            add_resource_as_progmem("PACKAGES_JS", js_file.read())
-
-    if _publishing_card(config):
-        cg.add_define("USE_WEBSERVER_PUBLISHING_API")
-        pub_id = ID(f"{var}_publishing_api", is_declaration=True, type=WebServerPublishingApi)
-        CORE.component_ids.add(str(pub_id))
-        pub_var = cg.new_Pvariable(pub_id)
-        await cg.register_component(pub_var, {})
-        cg.add(pub_var.set_web_server_base(paren))
-        js_path = Path(__file__).parent / "publishing_card.js"
-        with js_path.open(encoding="utf-8") as js_file:
-            add_resource_as_progmem("PUBLISHING_JS", js_file.read())
 
 
 def FILTER_SOURCE_FILES() -> list[str]:

@@ -200,8 +200,6 @@ class Storage : public Component {
   // via StorageInfo::is_mounted = false, not a non-OK error (see StorageRegistry below).
   virtual StorageError get_info(StorageInfo *info) = 0;
   virtual StorageType get_storage_type() const = 0;
-  virtual bool mount_settled() const { return true; }
-  virtual bool removable_media() const { return false; }
 
   // Bitwise OR of StorageCaps. Default 0: drivers must explicitly opt in to
   // capabilities -- a driver that never considered task-safety is never treated as such.
@@ -280,18 +278,6 @@ class RawStorage : public Storage {
 #endif
 };
 
-struct KvItem {
-  const char *key;
-  const char *value;
-};
-
-struct KvRead {
-  const char *key;
-  char *out;
-  size_t cap;
-  size_t len;
-};
-
 // Opaque blobs addressed by a 32-bit key, NOT by offset or path. A sibling of RawStorage, not a
 // subclass -- byte-addressed read()/write() do not apply, and modelling it as RawStorage would be an
 // is-a lie. Boot-guaranteed like RawStorage: no MountableStorage, registers once for the node's
@@ -311,14 +297,6 @@ class KeyValueStorage : public Storage {
 
   // Store `len` bytes under `key`, replacing any existing value.
   virtual StorageError set(uint32_t key, const uint8_t *data, size_t len) = 0;
-
-  virtual StorageError set_batch(const char *ns, const KvItem *items, size_t count) {
-    return StorageError::STORAGE_ERROR_NOT_SUPPORTED;
-  }
-
-  virtual StorageError get_batch(const char *ns, KvRead *items, size_t count) {
-    return StorageError::STORAGE_ERROR_NOT_SUPPORTED;
-  }
 
   // Remove `key`. Removing an absent key is a no-op success (idempotent).
   virtual StorageError erase(uint32_t key) = 0;
@@ -340,7 +318,6 @@ class KeyValueStorage : public Storage {
   // a flash-time-laid-out partition, real work for an external bus device on first boot once its bus
   // is up. Called at backend setup, never from codegen.
   virtual StorageError ensure_initialized() = 0;
-  virtual bool is_initialized() const { return true; }
 };
 
 // Path-based operations shared by FilesystemStorage and NetworkStorage, so path-oriented consumers
@@ -459,7 +436,6 @@ class NetworkStorage : public PathStorage {
   // stateless protocol has no open() to carry it. copy() calls it with 0 before the first chunk of
   // a file whose destination is a NetworkStorage.
   virtual StorageError truncate(const char *path, uint64_t size) = 0;
-  virtual StorageError write_done(const char *path, uint64_t size) { return StorageError::STORAGE_ERROR_OK; }
 };
 
 struct OpticalFileHandle : public FileHandle {
@@ -612,13 +588,6 @@ class StorageRegistry : public Component {
   // requests), above for "this device is gone". Kept apart so a driver can unmount removable media
   // without every consumer seeing a departure never followed by a re-registration.
   template<typename F> void add_on_quiesce_callback(F &&cb) { this->on_quiesce_.add(std::forward<F>(cb)); }
-  void removable_scan_begin() { this->removable_scans_++; }
-  void removable_scan_end() {
-    if (this->removable_scans_ > 0 && --this->removable_scans_ == 0)
-      this->on_scans_done_.call();
-  }
-  bool removable_scans_done() const { return this->removable_scans_ == 0; }
-  template<typename F> void add_on_scans_done_callback(F &&cb) { this->on_scans_done_.add(std::forward<F>(cb)); }
 
 #ifdef USE_STORAGE_CHANGE_FEED
   // Directory-change feed (main loop only). Whoever alters a directory's *listing* notes it here:
@@ -660,8 +629,6 @@ class StorageRegistry : public Component {
   LazyCallbackManager<void(Storage *)> on_registered_;
   LazyCallbackManager<void(Storage *)> on_unregistered_;
   LazyCallbackManager<void(Storage *)> on_quiesce_;
-  LazyCallbackManager<void()> on_scans_done_;
-  uint8_t removable_scans_{0};
 #ifdef USE_STORAGE_CHANGE_FEED
   LazyCallbackManager<void(const std::string &)> on_dir_changed_;
 #endif

@@ -65,15 +65,12 @@ struct Doc {
   size_t step{0};
   Read read_done;
   Done save_done;
-  st::FileStat info{};
 #endif
 };
 
-static constexpr uint8_t DOC_SLOTS = 2;
-
-inline Doc &doc(uint8_t slot = 0) {
-  static Doc d[DOC_SLOTS];
-  return d[slot < DOC_SLOTS ? slot : 0];
+inline Doc &doc() {
+  static Doc d;
+  return d;
 }
 
 // ---- The transfer buffer, borrowed ----------------------------------------------------------------------
@@ -114,7 +111,8 @@ inline bool task_busy_(const st::Storage *s) {
 #ifdef USE_STORAGE_WORKER
 // ---- Reading ---------------------------------------------------------------------------------------------
 
-inline void read_finish_(Doc &d, st::StorageError err) {
+inline void read_finish_(st::StorageError err) {
+  Doc &d = doc();
   d.busy = false;
   char *text = reinterpret_cast<char *>(d.buf);
   if (text != nullptr) {
@@ -138,118 +136,99 @@ inline void read_finish_(Doc &d, st::StorageError err) {
   give_back();
 }
 
-inline void read_close_(Doc &d, st::StorageError err) {
-  Doc *p = &d;
-  st::global_storage_worker->end_read(d.stream, [p, err](st::StorageError) { read_finish_(*p, err); });
+inline void read_close_(st::StorageError err) {
+  st::global_storage_worker->end_read(doc().stream, [err](st::StorageError) { read_finish_(err); });
 }
 
-inline void read_step_(Doc &d) {
+inline void read_step_() {
+  Doc &d = doc();
   if (d.len >= d.want) {
-    read_close_(d, st::StorageError::STORAGE_ERROR_OK);
+    read_close_(st::StorageError::STORAGE_ERROR_OK);
     return;
   }
   d.step = 0;
-  Doc *p = &d;
   const st::StorageError err = st::global_storage_worker->read_chunk(
-      d.stream, d.buf + d.len, std::min(CHUNK, d.want - d.len), &d.step, [p](st::StorageError e) {
-        Doc &d = *p;
+      d.stream, d.buf + d.len, std::min(CHUNK, d.want - d.len), &d.step, [](st::StorageError e) {
+        Doc &d = doc();
         if (e != st::StorageError::STORAGE_ERROR_OK) {
-          read_close_(d, e);
+          read_close_(e);
           return;
         }
         d.len += d.step;
         if (d.step == 0) {  // EOF before what stat said: the file shrank
-          read_close_(d, st::StorageError::STORAGE_ERROR_OK);
+          read_close_(st::StorageError::STORAGE_ERROR_OK);
           return;
         }
-        read_step_(d);
+        read_step_();
       });
   if (err != st::StorageError::STORAGE_ERROR_OK)
-    read_close_(d, err);
-}
-
-inline void load_fail_(Doc &d, st::StorageError err) {
-  d.busy = false;
-  Read done = std::move(d.read_done);
-  d.read_done = nullptr;
-  if (done)
-    done(err, "", 0);
-}
-
-inline void load_open_(Doc &d, st::StorageError e) {
-  if (e != st::StorageError::STORAGE_ERROR_OK) {
-    load_fail_(d, e);
-    return;
-  }
-  if (d.info.is_dir) {
-    load_fail_(d, st::StorageError::STORAGE_ERROR_INVALID_ARGS);
-    return;
-  }
-  const bool whole = d.info.size <= EDIT_MAX;
-  const size_t want = whole ? static_cast<size_t>(d.info.size) : WINDOW_MAX;
-  uint8_t *buf = borrow(want + 1);
-  if (buf == nullptr) {
-    load_fail_(d, st::StorageError::STORAGE_ERROR_NOT_READY);
-    return;
-  }
-  d.file_size = d.info.size;
-  d.offset = whole ? 0 : d.info.size - WINDOW_MAX;
-  d.editable = whole;
-  d.binary = false;
-  d.buf = buf;
-  d.len = 0;
-  d.want = want;
-  const uint64_t from = d.offset;
-  Doc *p = &d;
-  const st::StorageError err =
-      st::global_storage_worker->begin_read(d.ps, d.rel.c_str(), &d.stream, [p, from](st::StorageError e) {
-        if (e != st::StorageError::STORAGE_ERROR_OK) {
-          read_finish_(*p, e);
-          return;
-        }
-        if (from == 0) {
-          read_step_(*p);
-          return;
-        }
-        const st::StorageError s = st::global_storage_worker->seek(
-            p->stream, static_cast<int64_t>(from), st::SeekMode::SEEK_MODE_SET, [p](st::StorageError e2) {
-              if (e2 != st::StorageError::STORAGE_ERROR_OK) {
-                read_close_(*p, e2);
-                return;
-              }
-              read_step_(*p);
-            });
-        if (s != st::StorageError::STORAGE_ERROR_OK)
-          read_close_(*p, s);
-      });
-  if (err != st::StorageError::STORAGE_ERROR_OK)
-    read_finish_(d, err);
+    read_close_(err);
 }
 #endif
 
 // Reads `path`: whole when it is up to EDIT_MAX, else its last WINDOW_MAX bytes (read only). `done` gets the
 // text once (main loop) unless an immediate error is returned (NOT_READY also when the transfer buffer is
 // in use).
-inline st::StorageError load(Doc &d, const std::string &path, Read done) {
+inline st::StorageError load(const std::string &path, Read done) {
 #ifdef USE_STORAGE_WORKER
+  Doc &d = doc();
   if (d.busy || st::global_storage_worker == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_READY;
   std::string rel;
   st::PathStorage *ps = resolve_(path, &rel);
   if (ps == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_FOUND;
+  if (task_busy_(ps))
+    return st::StorageError::STORAGE_ERROR_NOT_READY;
+  st::FileStat info{};
+  st::StorageError err = ps->stat(rel.c_str(), &info);
+  if (err != st::StorageError::STORAGE_ERROR_OK)
+    return err;
+  if (info.is_dir)
+    return st::StorageError::STORAGE_ERROR_INVALID_ARGS;
+  const bool whole = info.size <= EDIT_MAX;
+  const size_t want = whole ? static_cast<size_t>(info.size) : WINDOW_MAX;
+  uint8_t *buf = borrow(want + 1);
+  if (buf == nullptr)
+    return st::StorageError::STORAGE_ERROR_NOT_READY;
   d.path = path;
   d.ps = ps;
   d.rel = rel;
-  d.info = st::FileStat{};
+  d.file_size = info.size;
+  d.offset = whole ? 0 : info.size - WINDOW_MAX;
+  d.editable = whole;
+  d.binary = false;
+  d.buf = buf;
+  d.len = 0;
+  d.want = want;
   d.read_done = std::move(done);
   d.busy = true;
-  Doc *p = &d;
-  const st::StorageError err = st::global_storage_worker->async_stat(
-      ps, d.rel.c_str(), &d.info, [p](st::StorageError e) { load_open_(*p, e); });
+  const uint64_t from = d.offset;
+  err = st::global_storage_worker->begin_read(ps, rel.c_str(), &d.stream, [from](st::StorageError e) {
+    if (e != st::StorageError::STORAGE_ERROR_OK) {
+      read_finish_(e);
+      return;
+    }
+    if (from == 0) {
+      read_step_();
+      return;
+    }
+    const st::StorageError s = st::global_storage_worker->seek(doc().stream, static_cast<int64_t>(from),
+                                                              st::SeekMode::SEEK_MODE_SET, [](st::StorageError e2) {
+                                                                if (e2 != st::StorageError::STORAGE_ERROR_OK) {
+                                                                  read_close_(e2);
+                                                                  return;
+                                                                }
+                                                                read_step_();
+                                                              });
+    if (s != st::StorageError::STORAGE_ERROR_OK)
+      read_close_(s);
+  });
   if (err != st::StorageError::STORAGE_ERROR_OK) {
     d.busy = false;
     d.read_done = nullptr;
+    d.buf = nullptr;
+    give_back();
   }
   return err;
 #else
@@ -257,12 +236,11 @@ inline st::StorageError load(Doc &d, const std::string &path, Read done) {
 #endif
 }
 
-inline st::StorageError load(const std::string &path, Read done) { return load(doc(), path, std::move(done)); }
-
 // ---- Saving: the caller's text, unchanged until done -------------------------------------------------------
 
 #ifdef USE_STORAGE_WORKER
-inline void save_finish_(Doc &d, st::StorageError err) {
+inline void save_finish_(st::StorageError err) {
+  Doc &d = doc();
   d.busy = false;
   d.src = nullptr;
   if (err == st::StorageError::STORAGE_ERROR_OK)
@@ -273,77 +251,68 @@ inline void save_finish_(Doc &d, st::StorageError err) {
     done(err);
 }
 
-inline void save_fail_(Doc &d, st::StorageError err) {
-  Doc *p = &d;
-  st::global_storage_worker->end_write(d.stream, [p, err](st::StorageError) {
-    Doc &d = *p;
-    if (st::global_storage_worker->async_remove(
-            d.ps, d.tmp_rel.c_str(), [p, err](st::StorageError) { save_finish_(*p, err); }, nullptr, false) !=
-        st::StorageError::STORAGE_ERROR_OK)
-      save_finish_(d, err);
+inline void save_fail_(st::StorageError err) {
+  st::global_storage_worker->end_write(doc().stream, [err](st::StorageError) {
+    Doc &d = doc();
+    if (!task_busy_(d.ps))
+      d.ps->remove(d.tmp_rel.c_str());
+    save_finish_(err);
   });
 }
 
-inline void save_publish_(Doc &d) {
-  Doc *p = &d;
-  const st::StorageError err = st::global_storage_worker->async_rename(
-      d.ps, d.tmp_rel.c_str(), d.rel.c_str(), [p](st::StorageError r) {
-        Doc &d = *p;
-        if (r == st::StorageError::STORAGE_ERROR_OK) {
-          d.file_size = d.len;
-          d.offset = 0;
-#ifdef USE_STORAGE_CHANGE_FEED
-          st::global_storage_registry->note_parent_changed(d.path);
-#endif
-        }
-        save_finish_(d, r);
-      });
-  if (err != st::StorageError::STORAGE_ERROR_OK)
-    save_finish_(d, err);
-}
-
-inline void save_step_(Doc &d) {
-  Doc *p = &d;
+inline void save_step_() {
+  Doc &d = doc();
   if (d.step >= d.len) {
-    st::global_storage_worker->end_write(d.stream, [p](st::StorageError e) {
-      Doc &d = *p;
+    st::global_storage_worker->end_write(d.stream, [](st::StorageError e) {
+      Doc &d = doc();
       if (e != st::StorageError::STORAGE_ERROR_OK) {
-        save_finish_(d, e);
+        save_finish_(e);
         return;
       }
-      const st::StorageError q = st::global_storage_worker->async_remove(
-          d.ps, d.rel.c_str(),
-          [p](st::StorageError r) {
-            if (r != st::StorageError::STORAGE_ERROR_OK && r != st::StorageError::STORAGE_ERROR_NOT_FOUND) {
-              save_finish_(*p, r);
-              return;
-            }
-            save_publish_(*p);
-          },
-          nullptr, false);
-      if (q != st::StorageError::STORAGE_ERROR_OK)
-        save_finish_(d, q);
+      // Written whole: the old file goes, the new one takes its name (FAT's rename does not replace)
+      if (task_busy_(d.ps)) {
+        save_finish_(st::StorageError::STORAGE_ERROR_NOT_READY);
+        return;
+      }
+      st::FileStat old{};
+      if (d.ps->stat(d.rel.c_str(), &old) == st::StorageError::STORAGE_ERROR_OK) {
+        const st::StorageError r = d.ps->remove(d.rel.c_str());
+        if (r != st::StorageError::STORAGE_ERROR_OK) {
+          save_finish_(r);
+          return;
+        }
+      }
+      const st::StorageError r = d.ps->rename(d.tmp_rel.c_str(), d.rel.c_str());
+      if (r == st::StorageError::STORAGE_ERROR_OK) {
+        d.file_size = d.len;
+        d.offset = 0;
+#ifdef USE_STORAGE_CHANGE_FEED
+        st::global_storage_registry->note_parent_changed(d.path);
+#endif
+      }
+      save_finish_(r);
     });
     return;
   }
   const size_t n = std::min(CHUNK, d.len - d.step);
   const st::StorageError err = st::global_storage_worker->write_chunk(
-      d.stream, reinterpret_cast<const uint8_t *>(d.src + d.step), n, [p, n](st::StorageError e) {
+      d.stream, reinterpret_cast<const uint8_t *>(d.src + d.step), n, [n](st::StorageError e) {
         if (e != st::StorageError::STORAGE_ERROR_OK) {
-          save_fail_(*p, e);
+          save_fail_(e);
           return;
         }
-        p->step += n;
-        save_step_(*p);
+        doc().step += n;
+        save_step_();
       });
   if (err != st::StorageError::STORAGE_ERROR_OK)
-    save_fail_(d, err);
+    save_fail_(err);
 }
 #endif
 
 // Saves `text` (len bytes; it must stay unchanged until `done`) to `path`; the document is that file then.
-inline st::StorageError save(Doc &d, const std::string &path, const char *text, size_t len, Done done) {
+inline st::StorageError save(const std::string &path, const char *text, size_t len, Done done) {
 #ifdef USE_STORAGE_WORKER
+  Doc &d = doc();
   if (d.busy || st::global_storage_worker == nullptr || text == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_READY;
   std::string rel;
@@ -363,13 +332,12 @@ inline st::StorageError save(Doc &d, const std::string &path, const char *text, 
   d.binary = false;
   d.save_done = std::move(done);
   d.busy = true;
-  Doc *p = &d;
-  const st::StorageError err = st::global_storage_worker->begin_write(ps, d.tmp_rel.c_str(), &d.stream, [p](st::StorageError e) {
+  const st::StorageError err = st::global_storage_worker->begin_write(ps, d.tmp_rel.c_str(), &d.stream, [](st::StorageError e) {
     if (e != st::StorageError::STORAGE_ERROR_OK) {
-      save_finish_(*p, e);
+      save_finish_(e);
       return;
     }
-    save_step_(*p);
+    save_step_();
   });
   if (err != st::StorageError::STORAGE_ERROR_OK) {
     d.busy = false;
@@ -380,10 +348,6 @@ inline st::StorageError save(Doc &d, const std::string &path, const char *text, 
 #else
   return st::StorageError::STORAGE_ERROR_NOT_READY;
 #endif
-}
-
-inline st::StorageError save(const std::string &path, const char *text, size_t len, Done done) {
-  return save(doc(), path, text, len, std::move(done));
 }
 
 // ---- Undo: one step, recorded from the text area's own insert events (no copy of the text) -----------------

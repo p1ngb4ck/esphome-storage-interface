@@ -4,7 +4,6 @@
 #ifdef USE_WEBSERVER
 #include "esphome/core/component.h"
 #include "esphome/core/component_iterator.h"
-#include "esphome/core/entity_settings.h"
 namespace esphome::json {
 class JsonBuilder;
 }  // namespace esphome::json
@@ -44,10 +43,6 @@ class ListEntitiesIterator final : public ComponentIterator {
  protected:
   // Same type as message_generator_t, which this header cannot include
   void send_all_(void *source, void (*generator)(WebServer *, void *, json::JsonBuilder &));
-  template<typename T> void send_entity_(T *obj, void (*generator)(WebServer *, void *, json::JsonBuilder &)) {
-    if ((global_entity_settings.off(obj) & ENTITY_WEB_OFF) == 0)
-      this->send_all_(obj, generator);
-  }
 
   const WebServer *web_server_;
 #ifdef USE_ESP32

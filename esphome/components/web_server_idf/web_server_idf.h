@@ -372,7 +372,6 @@ class AsyncEventSourceResponse {
     ~SendGuard() { this->owner.sending_ = false; }
   };
   void process_close_();
-  void relist_();
   static void close_session_work(void *arg);
   void refresh_lru_();
   static void refresh_lru_work(void *arg);
@@ -454,7 +453,6 @@ class AsyncEventSource : public AsyncWebHandler {
   /// Returns true if there are sessions remaining (including pending cleanup).
   bool loop();
   bool empty() { return this->count() == 0; }
-  void relist();
 
   size_t count() const { return this->sessions_.size(); }
 
