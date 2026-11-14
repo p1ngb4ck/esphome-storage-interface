@@ -62,7 +62,6 @@ struct Run {
   uint32_t sum{0};       // of what was written
   uint32_t sum_read{0};  // of what was read back
   size_t entries{0};
-  st::StorageInfo info{};
 #endif
 };
 
@@ -99,8 +98,9 @@ inline void finish_(bool failed) {
     st::global_transfer_buffer->release();
 #endif
   r.buf = nullptr;
-  if (failed && r.ps != nullptr)
-    st::global_storage_worker->async_remove(r.ps, r.dir.c_str(), [](st::StorageError) {});
+  // Whatever happened: the test folder goes (guarded like the actions)
+  if (r.ps != nullptr && !st::global_storage_worker->has_active_task_io(r.ps))
+    st::remove_recursive(r.ps, r.dir.c_str());
   if (failed) {
     for (auto &s : r.steps) {
       if (s.state == STEP_PENDING)
@@ -311,87 +311,22 @@ inline void step_list_() {
   }
 }
 
+// 5: everything deleted (a blocking call on the main loop, guarded; deferred one loop pass)
 inline void step_delete_() {
   set_(4, STEP_RUNNING);
   Run &r = run();
-  r.t0 = millis();
-  const st::StorageError err =
-      st::global_storage_worker->async_remove(r.ps, r.dir.c_str(), [](st::StorageError e) {
-        const bool ok = e == st::StorageError::STORAGE_ERROR_OK;
-        char text[48];
-        snprintf(text, sizeof(text), "%u ms", static_cast<unsigned>(millis() - run().t0));
-        set_(4, ok ? STEP_OK : STEP_FAILED, ok ? std::string(text) : std::string(st::error_to_string(e)));
-        finish_(!ok);
-      });
-  if (err != st::StorageError::STORAGE_ERROR_OK) {
-    set_(4, STEP_FAILED, st::error_to_string(err));
+  if (st::global_storage_worker->has_active_task_io(r.ps)) {
+    set_(4, STEP_FAILED, "the storage is busy");
     finish_(true);
+    return;
   }
-}
-
-inline void begin_big_() {
-  Run &r = run();
-  set_(0, STEP_RUNNING);
-  r.index = 0;
-  r.t0 = millis();
-  const st::StorageError err =
-      st::global_storage_worker->begin_write(r.ps, big_path_().c_str(), &r.stream, [](st::StorageError e) {
-        if (e != st::StorageError::STORAGE_ERROR_OK) {
-          set_(0, STEP_FAILED, st::error_to_string(e));
-          finish_(true);
-          return;
-        }
-        write_next_();
-      });
-  if (err != st::StorageError::STORAGE_ERROR_OK) {
-    set_(0, STEP_FAILED, st::error_to_string(err));
-    finish_(true);
-  }
-}
-
-inline void make_folder_() {
-  Run &r = run();
-  const st::StorageError err = st::global_storage_worker->async_mkdir(r.ps, r.dir.c_str(), [](st::StorageError e) {
-    if (e != st::StorageError::STORAGE_ERROR_OK) {
-      set_(0, STEP_FAILED, std::string("No test folder: ") + st::error_to_string(e));
-      finish_(true);
-      return;
-    }
-    begin_big_();
-  });
-  if (err != st::StorageError::STORAGE_ERROR_OK) {
-    set_(0, STEP_FAILED, std::string("No test folder: ") + st::error_to_string(err));
-    finish_(true);
-  }
-}
-
-inline void clear_folder_() {
-  Run &r = run();
-  if (st::global_storage_worker->async_remove(r.ps, r.dir.c_str(), [](st::StorageError) { make_folder_(); }) !=
-      st::StorageError::STORAGE_ERROR_OK)
-    make_folder_();
-}
-
-inline void check_info_() {
-  Run &r = run();
-  const st::StorageError err = st::global_storage_worker->async_get_info(r.ps, &r.info, [](st::StorageError e) {
-    Run &r = run();
-    if (e != st::StorageError::STORAGE_ERROR_OK || !r.info.is_mounted) {
-      set_(0, STEP_FAILED, "Not mounted");
-      finish_(true);
-      return;
-    }
-    if (r.info.is_read_only) {
-      set_(0, STEP_FAILED, "Read only");
-      finish_(true);
-      return;
-    }
-    clear_folder_();
-  });
-  if (err != st::StorageError::STORAGE_ERROR_OK) {
-    set_(0, STEP_FAILED, st::error_to_string(err));
-    finish_(true);
-  }
+  const uint32_t t0 = millis();
+  const st::StorageError err = st::remove_recursive(r.ps, r.dir.c_str());
+  char text[48];
+  snprintf(text, sizeof(text), "%u ms", static_cast<unsigned>(millis() - t0));
+  set_(4, err == st::StorageError::STORAGE_ERROR_OK ? STEP_OK : STEP_FAILED,
+       err == st::StorageError::STORAGE_ERROR_OK ? std::string(text) : std::string(st::error_to_string(err)));
+  finish_(err != st::StorageError::STORAGE_ERROR_OK);
 }
 #endif
 
@@ -411,8 +346,11 @@ inline bool start(const std::string &root, std::function<void()> on_change, std:
     return refuse("No storage worker");
   const char *rel = nullptr;
   st::PathStorage *ps = st::global_storage_registry->resolve_path(root.c_str(), &rel);
-  if (ps == nullptr)
+  st::StorageInfo info{};
+  if (ps == nullptr || ps->get_info(&info) != st::StorageError::STORAGE_ERROR_OK || !info.is_mounted)
     return refuse("Not mounted");
+  if (info.is_read_only)
+    return refuse("Read only");
   if (st::global_storage_worker->is_busy_with(ps))
     return refuse("The storage is busy");
   if (st::global_transfer_buffer == nullptr)
@@ -429,8 +367,29 @@ inline bool start(const std::string &root, std::function<void()> on_change, std:
   r.steps = {{"Write 16 MB"}, {"Read 16 MB back"}, {"100 small files (4 KB)"}, {"List the folder"},
              {"Delete the test files"}};
   r.busy = true;
-  r.info = st::StorageInfo{};
-  check_info_();
+  st::remove_recursive(ps, r.dir.c_str());  // a folder left from a run cut off
+  const st::StorageError mk = ps->mkdir(r.dir.c_str());
+  if (mk != st::StorageError::STORAGE_ERROR_OK) {
+    set_(0, STEP_FAILED, std::string("No test folder: ") + st::error_to_string(mk));
+    finish_(true);
+    return true;
+  }
+  set_(0, STEP_RUNNING);
+  r.index = 0;
+  r.t0 = millis();
+  const st::StorageError err =
+      st::global_storage_worker->begin_write(ps, big_path_().c_str(), &r.stream, [](st::StorageError e) {
+        if (e != st::StorageError::STORAGE_ERROR_OK) {
+          set_(0, STEP_FAILED, st::error_to_string(e));
+          finish_(true);
+          return;
+        }
+        write_next_();
+      });
+  if (err != st::StorageError::STORAGE_ERROR_OK) {
+    set_(0, STEP_FAILED, st::error_to_string(err));
+    finish_(true);
+  }
   return true;
 #else
   return refuse("No storage worker / transfer buffer");

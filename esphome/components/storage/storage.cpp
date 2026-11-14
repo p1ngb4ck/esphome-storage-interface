@@ -88,11 +88,6 @@ StorageError StorageRegistry::register_storage(Storage *s) {
     }
     this->storages_.push_back(s);
   }
-  note_registration(
-      [](void *registry, void *storage, void *) {
-        static_cast<StorageRegistry *>(registry)->unregister_storage(static_cast<Storage *>(storage));
-      },
-      this, s, nullptr);
 
   // Log regardless of get_info()'s result -- an unmounted-but-registered device (e.g. before
   // its medium is mounted) must still show up, per the get_info() contract on Storage above.

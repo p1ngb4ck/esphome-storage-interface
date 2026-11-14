@@ -72,14 +72,6 @@ enum class RequestOp : uint8_t {
   // the caller's list_entry with list_ctx -- on the worker task for task-safe media, else from a
   // loop() step. Same single-blocking-call shape as MOUNT; no handles, no change feed.
   LIST_DIR,
-  RAW_WRITE_BUFFER,
-  KV_BATCH,
-  KV_READ,
-  REMOVE,
-  MKDIR,
-  RENAME,
-  STAT,
-  GET_INFO,
 };
 
 // Where a request currently stands. Transitions:
@@ -290,7 +282,6 @@ struct TransferRequest {
   // move. The file side lives in src/dst_storage + src/dst_path as usual; the device side is
   // this pointer, deliberately part of overlaps_active_'s contention checks.
   storage::RawStorage *raw_device{nullptr};
-  const uint8_t *raw_data{nullptr};
   uint64_t raw_address{0};
   uint64_t raw_erase_pos{0};
   uint64_t raw_erase_end{0};
@@ -357,7 +348,6 @@ struct TransferRequest {
 enum class StreamOp : uint8_t {
   WRITE,  // caller pushes chunks in; storage receives them (e.g. HTTP upload -> file)
   READ,   // caller requests chunks out; storage supplies them (e.g. file -> HTTP download)
-  UPDATE,
 };
 
 // Where a stream currently stands. Transitions:
@@ -441,10 +431,6 @@ struct StreamRequest {
   // step still sitting in the worker-task queue so a long transfer ahead of it is not mistaken for a
   // vanished client.
   std::atomic<bool> step_started_{false};
-#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
-  std::atomic<TaskHandle_t> direct_waiter{nullptr};
-  storage::StorageError *direct_result{nullptr};
-#endif
 };
 
 // Tags a background-task queue entry so the single shared task can dispatch to either engine's
@@ -568,23 +554,6 @@ class StorageWorker : public PollingComponent {
   storage::StorageError async_raw_erase(storage::RawStorage *device, uint64_t address, uint64_t size,
                                         CompletionCallback &&on_done, TransferJob *job_out = nullptr,
                                         bool force_sliced = false);
-  storage::StorageError async_raw_write_buffer(storage::RawStorage *device, uint64_t address, const uint8_t *data,
-                                               size_t len, bool erase_first, CompletionCallback &&on_done,
-                                               TransferJob *job_out = nullptr);
-  storage::StorageError async_kv_batch(storage::KeyValueStorage *target, const char *ns, const storage::KvItem *items,
-                                       size_t count, CompletionCallback &&on_done, TransferJob *job_out = nullptr);
-  storage::StorageError async_kv_read(storage::KeyValueStorage *target, const char *ns, storage::KvRead *items,
-                                      size_t count, CompletionCallback &&on_done, TransferJob *job_out = nullptr);
-  storage::StorageError async_remove(storage::PathStorage *target, const char *path, CompletionCallback &&on_done,
-                                     TransferJob *job_out = nullptr, bool recursive = true);
-  storage::StorageError async_mkdir(storage::PathStorage *target, const char *path, CompletionCallback &&on_done,
-                                    TransferJob *job_out = nullptr);
-  storage::StorageError async_rename(storage::PathStorage *target, const char *from, const char *to,
-                                     CompletionCallback &&on_done, TransferJob *job_out = nullptr);
-  storage::StorageError async_stat(storage::PathStorage *target, const char *path, storage::FileStat *out,
-                                   CompletionCallback &&on_done, TransferJob *job_out = nullptr);
-  storage::StorageError async_get_info(storage::PathStorage *target, storage::StorageInfo *out,
-                                       CompletionCallback &&on_done, TransferJob *job_out = nullptr);
 
   // Snapshot of a transfer's externally observable state, for progress bars / job-status
   // endpoints. Main-loop-only (like all control-plane calls). Returns false when the job
@@ -652,17 +621,6 @@ class StorageWorker : public PollingComponent {
   storage::StorageError read_chunk(const StreamHandle &handle, uint8_t *buf, size_t len, size_t *bytes_read,
                                    CompletionCallback &&on_read);
   storage::StorageError end_read(const StreamHandle &handle, CompletionCallback &&on_closed);
-#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
-  storage::StorageError read_chunk_direct(const StreamHandle &handle, uint8_t *buf, size_t len, size_t *bytes_read,
-                                          storage::StorageError *result, TaskHandle_t waiter);
-  storage::StorageError write_chunk_direct(const StreamHandle &handle, const uint8_t *data, size_t len,
-                                           storage::StorageError *result, TaskHandle_t waiter);
-#endif
-  storage::StorageError begin_update(storage::PathStorage *storage, const char *path, StreamHandle *out_handle,
-                                     CompletionCallback &&on_open);
-  storage::StorageError end_update(const StreamHandle &handle, CompletionCallback &&on_closed) {
-    return this->end_write(handle, std::move(on_closed));
-  }
 
   // Repositions the stream's cursor (SeekMode as in storage.h: SET/CUR/END). For a filesystem
   // stream this seeks the open handle; for a network stream it is arithmetic on the read/write
@@ -679,8 +637,7 @@ class StorageWorker : public PollingComponent {
   storage::StorageError submit_control_op_(RequestOp op, storage::Storage *target, CompletionCallback &&on_done,
                                            TransferJob *job_out, const char *path = "",
                                            bool (*list_entry)(const storage::FileStat *, void *) = nullptr,
-                                           void *list_ctx = nullptr, const char *src_path = "",
-                                           const uint8_t *data = nullptr, uint64_t count = 0);
+                                           void *list_ctx = nullptr);
   storage::StorageError submit_(RequestOp op, storage::PathStorage *src, const char *src_path,
                                 storage::PathStorage *dst, const char *dst_path, CompletionCallback &&on_done,
                                 TransferJob *job_out = nullptr, bool overwrite = false);
@@ -711,27 +668,13 @@ class StorageWorker : public PollingComponent {
   storage::StorageError submit_raw_(RequestOp op, storage::RawStorage *device, uint64_t address, uint64_t size,
                                     storage::PathStorage *file_side, const char *file_path, bool erase_first,
                                     bool overwrite, CompletionCallback &&on_done, TransferJob *job_out,
-                                    bool force_sliced = false, uint8_t verify_passes = 0,
-                                    const uint8_t *data = nullptr);
+                                    bool force_sliced = false, uint8_t verify_passes = 0);
   // on_task carries the engine flag from run_chunk_ (see there): the whole-chip erase fast path
   // is only taken on the worker task.
   void run_raw_chunk_(TransferRequest &req, bool on_task);
-  void run_raw_buffer_chunk_(TransferRequest &req);
-  static bool uses_target_(RequestOp op) {
-    return op == RequestOp::FORMAT || op == RequestOp::KV_BATCH || op == RequestOp::KV_READ;
-  }
-  static bool path_control_(RequestOp op) {
-    return op == RequestOp::MOUNT || op == RequestOp::LIST_DIR || op == RequestOp::REMOVE || op == RequestOp::MKDIR ||
-           op == RequestOp::RENAME || op == RequestOp::STAT || op == RequestOp::GET_INFO;
-  }
   // This engine's streaming buffer, allocated on first use. Returns nullptr (and leaves
   // *size_out untouched) if it cannot be had.
   uint8_t *chunk_buffer_(bool on_task, size_t *size_out);
-#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
-  storage::StorageError chunk_direct_(StreamRequest &req, size_t index, StreamState step, uint8_t *read_buf,
-                                      const uint8_t *write_data, size_t len, size_t *bytes_read,
-                                      storage::StorageError *result, TaskHandle_t waiter);
-#endif
   void check_stalled_();
   uint32_t last_stall_check_ms_{0};
   ProgressListener progress_cb_{nullptr};
@@ -790,8 +733,6 @@ class StorageWorker : public PollingComponent {
   // begin_*/write_chunk/read_chunk/end_* call frame. See run_stream_step_()'s doc above for
   // why streams need this rather than reusing TransferRequest's dispatch in submit_().
   void dispatch_stream_step_(StreamRequest &req, size_t index);
-  storage::StorageError begin_stream_(StreamOp op, storage::PathStorage *storage, const char *path,
-                                      StreamHandle *out_handle, CompletionCallback &&on_open);
 
   // Hotplug: synchronously cancels and drains every request/stream touching an unregistered
   // storage before returning, so the driver can proceed to unmount/tear down the storage

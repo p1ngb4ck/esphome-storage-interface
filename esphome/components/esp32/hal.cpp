@@ -2,7 +2,6 @@
 
 #include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
-#include "system_info.h"
 
 #include <esp_clk_tree.h>
 #include <esp_ota_ops.h>
@@ -49,8 +48,7 @@ void arch_init() {
   // Handle OTA rollback: mark partition valid immediately unless USE_OTA_ROLLBACK is enabled,
   // in which case safe_mode will mark it valid after confirming successful boot.
 #ifndef USE_OTA_ROLLBACK
-  if (esp32::system_info::has_otadata())
-    esp_ota_mark_app_valid_cancel_rollback();
+  esp_ota_mark_app_valid_cancel_rollback();
 #endif
 }
 

@@ -76,14 +76,6 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
   void set_enable_list(bool enable) { this->enable_list_ = enable; }
   void set_enable_read(bool enable) { this->enable_read_ = enable; }
   void set_enable_write(bool enable) { this->enable_write_ = enable; }
-  static void set_transfer_chunk(uint32_t bytes) {
-    if (bytes < 4096)
-      bytes = 4096;
-    if (bytes > 1024 * 1024)
-      bytes = 1024 * 1024;
-    transfer_chunk_ = bytes & ~static_cast<uint32_t>(511);
-  }
-  static uint32_t transfer_chunk() { return transfer_chunk_; }
   void set_enable_delete(bool enable) { this->enable_delete_ = enable; }
   void set_enable_mount(bool enable) { this->enable_mount_ = enable; }
   void set_enable_format(bool enable) { this->enable_format_ = enable; }
@@ -129,6 +121,10 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
   // Sends a 403 with a small JSON body; `what` names the disallowed operation group for the log.
   void send_forbidden_(AsyncWebServerRequest *request, const char *what);
   void handle_upload_response_(AsyncWebServerRequest *request);
+  // Atomically publish a finished upload: rename the temp sibling to its final name (a
+  // same-directory rename is atomic); overwrite is remove-then-rename. Main-loop-only.
+  static storage::StorageError publish_upload_(storage::PathStorage *ps, const char *temp, const char *final_path,
+                                               bool overwrite);
 
   static void send_error_(AsyncWebServerRequest *request, storage::StorageError err);
   static int http_status_for_(storage::StorageError err);
@@ -218,9 +214,9 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
     bool gzip{false};
   };
   static constexpr size_t DL_QUEUE_DEPTH = 4;
-  static inline uint32_t transfer_chunk_{64 * 1024};
+  static constexpr size_t DL_CHUNK = 64 * 1024;
   void pump_download_(DownloadJob *job);
-  void dl_read_start_(storage::StreamHandle stream, uint8_t *buf, size_t len, size_t *got, storage::StorageError *err);
+  void dl_read_start_(storage::StreamHandle stream, uint8_t *buf, size_t *got, storage::StorageError *err);
   // Issues one worker stream call (begin_read/read_chunk/end_read) on the main loop and blocks the
   // transfer task until its completion callback fires. All download file I/O goes through the
   // worker this way -- never a direct storage call.
@@ -254,15 +250,6 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
     // main-loop hop per chunk; nullptr keeps the plain streaming path.
     uint8_t *staged{nullptr};
     size_t staged_cap{0};
-    uint8_t *window{nullptr};
-    size_t window_half{0};
-    size_t window_fill{0};
-    uint8_t window_index{0};
-    bool window_inflight{false};
-    bool window_own{false};
-    size_t window_size{0};
-    TaskHandle_t window_task{nullptr};
-    storage::StorageError window_result{storage::StorageError::STORAGE_ERROR_OK};
 #endif
   } upload_{};
 
@@ -280,21 +267,14 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
     bool stream_open{false};
     bool writing{false};   // a worker write_chunk is in flight
     bool closing{false};   // a worker end_write is in flight
-    bool publishing{false};
     char rel_path[storage::STORAGE_PATH_MAX]{};
     char final_path[storage::STORAGE_PATH_MAX]{};
     bool overwrite{false};
     const uint8_t *data{nullptr};
     size_t total{0};
     size_t done{0};
-    size_t chunk_max{0};
-    uint8_t *own{nullptr};
-    size_t own_size{0};
-    bool on_task{false};
     storage::StorageError result{storage::StorageError::STORAGE_ERROR_OK};
   } flush_{};
-  void pump_flush_();
-  void buffer_release_(uint8_t *own, size_t size);
   uint32_t flush_job_counter_{0};
   // A finished staged-upload flush lives only in the single flush_ slot, which the next upload
   // overwrites. Keep the last few results here so a late /files/job poll still resolves a
@@ -313,9 +293,6 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
   // Publishes a drained staged upload (rename temp -> final, change note, cache) once the worker
   // end_write has completed. Runs on the main loop (from the flush completion callback).
   void finalize_flush_();
-  void finish_flush_();
-  storage::StorageError window_hand_();
-  void window_wait_();
 #endif
 };
 

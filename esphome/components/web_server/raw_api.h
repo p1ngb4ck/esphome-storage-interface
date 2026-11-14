@@ -62,7 +62,6 @@ class WebServerRawApi : public Component, public AsyncWebHandler {
   // Runs `op` on the main loop and blocks the calling (httpd) task until it completed. Returns
   // false on timeout -- the op may still run later, so it must only touch state that stays valid.
   bool run_on_loop_(std::function<void()> &&op, uint32_t timeout_ms = 10000);
-  storage::StorageError worker_await_(std::function<storage::StorageError(storage::CompletionCallback)> &&call);
 
   // Resolves the ?device= parameter against the registry (honoring the optional scope).
   storage::RawStorage *find_device_(AsyncWebServerRequest *request);
