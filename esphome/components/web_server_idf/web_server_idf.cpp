@@ -275,8 +275,7 @@ esp_err_t AsyncWebServer::request_handler_(AsyncWebServerRequest *request) const
     this->on_not_found_(request);
     return ESP_OK;
   }
-  request->send(404);
-  return ESP_OK;
+  return ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t AsyncWebServer::handle_raw_body_(httpd_req_t *r, const char *content_type) {
@@ -955,13 +954,6 @@ void AsyncEventSourceResponse::request_close_() {
   }
 
   this->process_close_();
-}
-
-void AsyncEventSourceResponse::relist_() { this->entities_iterator_.begin(this->web_server_->include_internal_); }
-
-void AsyncEventSource::relist() {
-  for (auto *session : this->sessions_)
-    session->relist_();
 }
 
 void AsyncEventSourceResponse::process_close_() {
