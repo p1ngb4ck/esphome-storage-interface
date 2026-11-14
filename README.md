@@ -87,3 +87,15 @@ core of the build host stays as installed.
 The advanced file browser is CubicleSoft's [js-fileexplorer](https://github.com/cubiclesoft/js-fileexplorer) (MIT) -
 thank you for such a complete widget. Everyone this project builds on:
 [ATTRIBUTIONS.md](https://github.com/p1ngb4ck/esphome/blob/dev/ATTRIBUTIONS.md).
+
+## Branch structure
+
+Each `pr/` branch holds one part of this topic on top of upstream and says in its `BRANCH.md` what it is based on. `main` holds all of them.
+
+| Branch | Based on |
+|---|---|
+| `pr/esp32-exfat-fat-volumes` | `pr/esp32-idf-component-override-path` of p1ngb4ck/esphome-esp32-platform |
+| `pr/storage` | `pr/esp32-exfat-fat-volumes`, `pr/esp32-loop-task-core` of p1ngb4ck/esphome-esp32-platform |
+| `pr/storage-write-done` | `pr/storage` |
+| `pr/web-server-file-api` | `pr/storage`, `pr/web-server-idf-file-uploads` |
+| `pr/web-server-idf-file-uploads` | upstream only |
