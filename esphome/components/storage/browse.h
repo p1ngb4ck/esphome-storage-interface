@@ -422,65 +422,41 @@ inline size_t selected_count() {
 }
 
 // ---- single operations (main loop, guarded) ---------------------------------------------------------
-inline st::StorageError make_dir(const std::string &dir, const std::string &name) {
+#ifdef USE_STORAGE_WORKER
+inline st::StorageError make_dir(const std::string &dir, const std::string &name, st::CompletionCallback &&done) {
   std::string rel;
   st::PathStorage *ps = resolve(join(dir, name.c_str()), &rel);
-  if (ps == nullptr)
+  if (ps == nullptr || st::global_storage_worker == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_FOUND;
-  if (task_busy(ps))
-    return st::StorageError::STORAGE_ERROR_NOT_READY;
-  const st::StorageError err = ps->mkdir(rel.c_str());
-#ifdef USE_STORAGE_CHANGE_FEED
-  if (err == st::StorageError::STORAGE_ERROR_OK)
-    st::global_storage_registry->note_dir_changed(dir);
-#endif
-  return err;
+  return st::global_storage_worker->async_mkdir(ps, rel.c_str(), std::move(done));
 }
 
-inline st::StorageError rename_entry(const std::string &dir, const char *from, const std::string &to) {
+inline st::StorageError rename_entry(const std::string &dir, const char *from, const std::string &to,
+                                     st::CompletionCallback &&done) {
   std::string rel_from, rel_to;
   st::PathStorage *ps = resolve(join(dir, from), &rel_from);
   st::PathStorage *ps_to = resolve(join(dir, to.c_str()), &rel_to);
-  if (ps == nullptr || ps != ps_to)
+  if (ps == nullptr || ps != ps_to || st::global_storage_worker == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_FOUND;
-  if (task_busy(ps))
-    return st::StorageError::STORAGE_ERROR_NOT_READY;
-  const st::StorageError err = ps->rename(rel_from.c_str(), rel_to.c_str());
-#ifdef USE_STORAGE_CHANGE_FEED
-  if (err == st::StorageError::STORAGE_ERROR_OK)
-    st::global_storage_registry->note_dir_changed(dir);
-#endif
-  return err;
+  return st::global_storage_worker->async_rename(ps, rel_from.c_str(), rel_to.c_str(), std::move(done));
 }
 
-// Deletes one entry (a folder with everything in it)
-inline st::StorageError delete_entry(const std::string &path) {
+inline st::StorageError delete_entry(const std::string &path, st::CompletionCallback &&done) {
   std::string rel;
   st::PathStorage *ps = resolve(path, &rel);
-  if (ps == nullptr)
+  if (ps == nullptr || st::global_storage_worker == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_FOUND;
-  if (task_busy(ps))
-    return st::StorageError::STORAGE_ERROR_NOT_READY;
-  st::FileStat info{};
-  st::StorageError err = ps->stat(rel.c_str(), &info);
-  if (err != st::StorageError::STORAGE_ERROR_OK)
-    return err;
-  err = info.is_dir ? st::remove_recursive(ps, rel.c_str()) : ps->remove(rel.c_str());
-#ifdef USE_STORAGE_CHANGE_FEED
-  st::global_storage_registry->note_parent_changed(path);
-#endif
-  return err;
+  return st::global_storage_worker->async_remove(ps, rel.c_str(), std::move(done));
 }
 
-inline st::StorageError stat_entry(const std::string &path, st::FileStat *out) {
+inline st::StorageError stat_entry(const std::string &path, st::FileStat *out, st::CompletionCallback &&done) {
   std::string rel;
   st::PathStorage *ps = resolve(path, &rel);
-  if (ps == nullptr)
+  if (ps == nullptr || st::global_storage_worker == nullptr)
     return st::StorageError::STORAGE_ERROR_NOT_FOUND;
-  if (task_busy(ps))
-    return st::StorageError::STORAGE_ERROR_NOT_READY;
-  return ps->stat(rel.c_str(), out);
+  return st::global_storage_worker->async_stat(ps, rel.c_str(), out, std::move(done));
 }
+#endif
 
 // ---- clipboard and paste (worker) ---------------------------------------------------------------------
 // The page's selected entries into `c` (the clipboard: cut = moved on paste). Returns how many.

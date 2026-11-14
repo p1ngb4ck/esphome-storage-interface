@@ -4,6 +4,11 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 #include "esphome/core/preferences_rtc.h"
+#include "nvs_guard.h"
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+#include "esphome/components/storage/storage.h"
+#include "esphome/components/binary_storage/nvs_store.h"
+#endif
 #include <esp_attr.h>
 #include <nvs_flash.h>
 #include <soc/soc_caps.h>
@@ -14,9 +19,42 @@ namespace esphome::esp32 {
 
 ESPHOME_LOG_TAG(TAG, "preferences");
 
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+// The esp32 flash preference path routed through the KeyValueStorage interface. The store adopts the
+// "esphome" NVS handle that open() establishes very early (before the logger), so this is
+// format-identical to raw NVS -- it is the interface seam the storage-backed override hooks into.
+// The RTC path is untouched and never goes through here.
+static binary_storage::NVSStore s_pref_store;
+#endif
+
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+static storage::KeyValueStorage *s_kv = nullptr;
+static storage::KeyValueStorage *s_external = nullptr;
+
+static storage::KeyValueStorage *current_kv() {
+  return s_external != nullptr && s_external->is_initialized() ? s_external : s_kv;
+}
+
+static storage::KeyValueStorage *kv_of(storage::KeyValueStorage *kv) { return kv != nullptr ? kv : current_kv(); }
+
+// True iff a value of exactly len bytes exists for key; fills data on success.
+static bool pref_kv_read(storage::KeyValueStorage *kv, uint32_t key, uint8_t *data, size_t len) {
+  size_t stored = 0;
+  if (kv == nullptr || kv->get_size(key, &stored) != storage::StorageError::STORAGE_ERROR_OK)
+    return false;
+  if (stored != len)
+    return false;
+  size_t got = 0;
+  return kv->get(key, data, len, &got) == storage::StorageError::STORAGE_ERROR_OK && got == len;
+}
+#endif
+
 struct NVSData {
   uint32_t key;
   SmallInlineBuffer<8> data;  // Most prefs fit in 8 bytes (covers fan, cover, select, etc.)
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  storage::KeyValueStorage *kv{nullptr};
+#endif
 };
 
 static std::vector<NVSData> s_pending_save;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -84,6 +122,9 @@ bool ESP32PreferenceBackend::save(const uint8_t *data, size_t len) {
   NVSData save{};
   save.key = this->key;
   save.data.set(data, len);
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  save.kv = this->kv;
+#endif
   s_pending_save.push_back(std::move(save));
   ESP_LOGVV(TAG, "s_pending_save: key: %" PRIu32 ", len: %zu", this->key, len);
   return true;
@@ -109,6 +150,10 @@ bool ESP32PreferenceBackend::load(uint8_t *data, size_t len) {
   char key_str[UINT32_MAX_STR_SIZE];
   uint32_to_str(key_str, this->key);
   size_t actual_len;
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  if (kv_of(this->kv) != nullptr)
+    return pref_kv_read(kv_of(this->kv), this->key, data, len);
+#endif
   esp_err_t err = nvs_get_blob(this->nvs_handle, key_str, nullptr, &actual_len);
   if (err != 0) {
     ESP_LOGV(TAG, "nvs_get_blob('%s'): %s - the key might not be set yet", key_str, esp_err_to_name(err));
@@ -132,20 +177,64 @@ void ESP32Preferences::open() {
   // Runs from app_main() before the logger is initialized; any logging here
   // must be deferred. See s_open_err and make_preference() below.
   // Components that need NVS check nvs_handle instead of initializing it again.
-  nvs_flash_init();
-  esp_err_t err = nvs_open("esphome", NVS_READWRITE, &this->nvs_handle);
-  if (err == 0)
+#ifdef USE_ESP32_NVS_GUARD
+  nvs_guard::open_partition(&this->nvs_ready);
+  if (!this->nvs_ready) {
+    this->nvs_handle = 0;
     return;
+  }
+#else
+  esp_err_t init_err = nvs_flash_init();
+  if (init_err == ESP_ERR_NVS_NO_FREE_PAGES || init_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    nvs_flash_erase();
+    init_err = nvs_flash_init();
+  }
+  this->nvs_ready = init_err == ESP_OK;
+#endif
+#ifdef USE_ESP32_PREFERENCES_NO_INTERNAL
+  // Preferences are backed by an external store bound later (set_external_preferences_store);
+  // do not open the internal "esphome" namespace or fall back to it. nvs_flash_init() above is
+  // kept because other IDF subsystems (wifi/BT calibration) may need the default partition. s_kv
+  // stays null until the external store is bound, so any preference read before then returns the
+  // default -- pre-storage readers must therefore use RTC (keep_early).
+  this->nvs_handle = 0;
+  return;
+#endif
+#ifdef USE_ESP32_NVS_GUARD
+  const nvs_open_mode_t mode = nvs_guard::state().read_only ? NVS_READONLY : NVS_READWRITE;
+#else
+  const nvs_open_mode_t mode = NVS_READWRITE;
+#endif
+  esp_err_t err = nvs_open("esphome", mode, &this->nvs_handle);
+  if (err == 0) {
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+    s_pref_store.set_namespace("esphome");
+    s_pref_store.adopt_handle(this->nvs_handle);
+    s_kv = &s_pref_store;
+#endif
+    return;
+  }
 
   s_open_err = err;
+#ifdef USE_ESP32_NVS_GUARD
+  this->nvs_handle = 0;
+#else
   nvs_flash_deinit();
   nvs_flash_erase();
-  nvs_flash_init();
+  this->nvs_ready = nvs_flash_init() == ESP_OK;
 
   err = nvs_open("esphome", NVS_READWRITE, &this->nvs_handle);
   if (err != 0) {
     this->nvs_handle = 0;
   }
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  else {
+    s_pref_store.set_namespace("esphome");
+    s_pref_store.adopt_handle(this->nvs_handle);
+    s_kv = &s_pref_store;
+  }
+#endif
+#endif
 }
 
 ESPPreferenceObject ESP32Preferences::make_preference(size_t length, uint32_t type, bool in_flash) {
@@ -169,6 +258,9 @@ ESPPreferenceObject ESP32Preferences::make_preference(size_t length, uint32_t ty
 }
 
 ESPPreferenceObject ESP32Preferences::make_preference(size_t length, uint32_t type) {
+#ifdef USE_ESP32_NVS_GUARD
+  nvs_guard::claim(type, length);
+#endif
   if (s_open_err != ESP_OK) {
     if (this->nvs_handle == 0) {
       ESP_LOGW(TAG, "nvs_open failed: %s - NVS unavailable", esp_err_to_name(s_open_err));
@@ -186,6 +278,9 @@ ESP32PreferenceBackend ESP32Preferences::make_backend_(uint32_t type) const {
   ESP32PreferenceBackend backend;
   backend.nvs_handle = this->nvs_handle;
   backend.key = type;
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  backend.kv = registration_hook != nullptr || s_kv == nullptr ? current_kv() : s_kv;
+#endif
   return backend;
 }
 
@@ -220,6 +315,12 @@ ESPPreferenceObject ESP32Preferences::make_rtc_preference_(size_t length, uint32
 bool ESP32Preferences::sync() {
   if (s_pending_save.empty())
     return true;
+#ifdef USE_ESP32_NVS_GUARD
+  if (nvs_guard::state().read_only) {
+    s_pending_save.clear();
+    return false;
+  }
+#endif
 
   ESP_LOGV(TAG, "Saving %zu items...", s_pending_save.size());
   int cached = 0, written = 0, failed = 0;
@@ -231,7 +332,16 @@ bool ESP32Preferences::sync() {
     uint32_to_str(key_str, save.key);
     ESP_LOGVV(TAG, "Checking if NVS data %s has changed", key_str);
     if (this->is_changed_(this->nvs_handle, save, key_str)) {
-      esp_err_t err = nvs_set_blob(this->nvs_handle, key_str, save.data.data(), save.data.size());
+      esp_err_t err;
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+      if (kv_of(save.kv) != nullptr)
+        err = kv_of(save.kv)->set(save.key, save.data.data(), save.data.size()) ==
+                      storage::StorageError::STORAGE_ERROR_OK
+                  ? ESP_OK
+                  : ESP_FAIL;
+      else
+#endif
+        err = nvs_set_blob(this->nvs_handle, key_str, save.data.data(), save.data.size());
       ESP_LOGV(TAG, "sync: key: %s, len: %zu", key_str, save.data.size());
       if (err != 0) {
         ESP_LOGV(TAG, "nvs_set_blob('%s', len=%zu) failed: %s", key_str, save.data.size(), esp_err_to_name(err));
@@ -259,7 +369,8 @@ bool ESP32Preferences::sync() {
              failed);
   }
 
-  // note: commit on esp-idf currently is a no-op, nvs_set_blob always writes
+  if (this->nvs_handle == 0)
+    return failed == 0;
   esp_err_t err = nvs_commit(this->nvs_handle);
   if (err != 0) {
     ESP_LOGV(TAG, "nvs_commit() failed: %s", esp_err_to_name(err));
@@ -271,6 +382,20 @@ bool ESP32Preferences::sync() {
 
 bool ESP32Preferences::is_changed_(uint32_t nvs_handle, const NVSData &to_save, const char *key_str) {
   size_t actual_len;
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+  storage::KeyValueStorage *kv = kv_of(to_save.kv);
+  if (kv != nullptr) {
+    if (kv->get_size(to_save.key, &actual_len) != storage::StorageError::STORAGE_ERROR_OK)
+      return true;  // not set yet -> changed
+    if (actual_len != to_save.data.size())
+      return true;
+    SmallBufferWithHeapFallback<256> stored_data(actual_len);
+    size_t got = 0;
+    if (kv->get(to_save.key, stored_data.get(), actual_len, &got) != storage::StorageError::STORAGE_ERROR_OK)
+      return true;
+    return memcmp(to_save.data.data(), stored_data.get(), to_save.data.size()) != 0;
+  }
+#endif
   esp_err_t err = nvs_get_blob(nvs_handle, key_str, nullptr, &actual_len);
   if (err != 0) {
     ESP_LOGV(TAG, "nvs_get_blob('%s'): %s - the key might not be set yet", key_str, esp_err_to_name(err));
@@ -310,6 +435,14 @@ bool ESP32Preferences::reset() {
 static ESP32Preferences s_preferences;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 ESP32Preferences *get_preferences() { return &s_preferences; }
+
+#ifdef USE_ESP32_PREFERENCES_STORAGE
+// Rebind the flash-preference KeyValueStorage to an external store (e.g. an esp_partition NVS on
+// external flash). All flash-backed preferences created AFTER this call read/write through the new
+// store; earlier ones keep their store. Called once the external store is initialised (storage
+// stage). RTC-backed preferences (in_flash=false) are unaffected.
+void set_external_preferences_store(storage::KeyValueStorage *kv) { s_external = kv; }
+#endif
 
 void setup_preferences() {
   s_preferences.open();

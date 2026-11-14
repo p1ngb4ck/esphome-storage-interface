@@ -49,6 +49,24 @@ bool WebServerRawApi::run_on_loop_(std::function<void()> &&op, uint32_t timeout_
   return true;
 }
 
+storage::StorageError WebServerRawApi::worker_await_(
+    std::function<storage::StorageError(storage::CompletionCallback)> &&call) {
+  SemaphoreHandle_t done = this->op_done_;
+  storage::StorageError result = storage::StorageError::STORAGE_ERROR_OK;
+  this->defer([call = std::move(call), done, &result]() {
+    storage::StorageError rej = call([done, &result](storage::StorageError e) {
+      result = e;
+      xSemaphoreGive(done);
+    });
+    if (rej != storage::StorageError::STORAGE_ERROR_OK) {
+      result = rej;
+      xSemaphoreGive(done);
+    }
+  });
+  xSemaphoreTake(done, portMAX_DELAY);
+  return result;
+}
+
 static void append_json_escaped(std::string &out, const char *s) {
   for (const char *p = s; *p != '\0'; p++) {
     if (*p == '"' || *p == '\\') {
@@ -565,9 +583,10 @@ void WebServerRawApi::handleBody(AsyncWebServerRequest *request, uint8_t *data, 
       uint64_t erase_len = total;
       if ((erase_len % geo.erase_sector) != 0)
         erase_len += geo.erase_sector - (erase_len % geo.erase_sector);
-      storage::StorageError err = storage::StorageError::STORAGE_ERROR_OK;
       uint64_t addr = this->write_.address;
-      this->run_on_loop_([device, addr, erase_len, &err]() { err = device->erase(addr, erase_len); }, 120000);
+      storage::StorageError err = this->worker_await_([device, addr, erase_len](storage::CompletionCallback cb) {
+        return storage::global_storage_worker->async_raw_erase(device, addr, erase_len, std::move(cb));
+      });
       if (err != storage::StorageError::STORAGE_ERROR_OK) {
         this->write_.failed = true;
         this->write_.error = storage::error_to_string(err);
@@ -581,21 +600,15 @@ void WebServerRawApi::handleBody(AsyncWebServerRequest *request, uint8_t *data, 
 
   storage::RawStorage *device = this->write_.device;
   uint64_t at = this->write_.address + index;
-  size_t done = 0;
-  while (done < len && !this->write_.failed) {
-    size_t written = 0;
-    storage::StorageError err = storage::StorageError::STORAGE_ERROR_OK;
-    bool loop_ok = this->run_on_loop_([device, at, data, done, len, &written, &err]() {
-      err = device->write(at + done, data + done, len - done, &written);
-    });
-    if (!loop_ok || err != storage::StorageError::STORAGE_ERROR_OK || written == 0) {
-      this->write_.failed = true;
-      this->write_.error = loop_ok ? storage::error_to_string(err) : "device busy";
-      return;
-    }
-    done += written;
+  storage::StorageError err = this->worker_await_([device, at, data, len](storage::CompletionCallback cb) {
+    return storage::global_storage_worker->async_raw_write_buffer(device, at, data, len, false, std::move(cb));
+  });
+  if (err != storage::StorageError::STORAGE_ERROR_OK) {
+    this->write_.failed = true;
+    this->write_.error = storage::error_to_string(err);
+    return;
   }
-  this->write_.written += done;
+  this->write_.written += len;
 }
 
 }  // namespace esphome::web_server

@@ -18,6 +18,9 @@
 
 #include <cstdlib>
 
+#ifdef USE_RUNTIME_LANGUAGE
+#include "esphome/components/runtime_language/runtime_language.h"
+#endif
 #ifdef USE_LIGHT
 #include "esphome/components/light/light_json_schema.h"
 #endif
@@ -196,6 +199,8 @@ EntityMatchResult UrlMatch::match_entity(EntityBase *entity) const {
   // Internal entities are unreachable by URL unless include_internal is set, as with the native API and MQTT.
   if (!this->include_internal && entity->is_internal())
     return result;
+  if ((global_entity_settings.off(entity) & ENTITY_WEB_OFF) != 0)
+    return result;
 
 #ifdef USE_DEVICES
   Device *entity_device = entity->get_device();
@@ -360,6 +365,14 @@ void DeferredUpdateEventSourceList::on_client_connect_(DeferredUpdateEventSource
       source->try_send_nodefer(group_msg.c_str(), group_msg.size(), "sorting_group");
     }
 #endif
+    for (uint8_t i = 0; i < global_entity_settings.group_count(); i++) {
+      json::JsonBuilder builder;
+      JsonObject root = builder.root();
+      root[ESPHOME_F("name")] = global_entity_settings.group_name(i);
+      root[ESPHOME_F("sorting_weight")] = i;
+      auto group_msg = builder.serialize();
+      source->try_send_nodefer(group_msg.c_str(), group_msg.size(), "sorting_group");
+    }
 
     source->entities_iterator_.begin(ws->include_internal_);
   });
@@ -392,7 +405,12 @@ json::SerializationBuffer<> WebServer::get_config_json() {
   json::JsonBuilder builder;
   JsonObject root = builder.root();
 
+#ifdef USE_NETWORK
+  root[ESPHOME_F("title")] = linked(network::device_friendly_name().empty() ? network::device_name()
+                                                                             : network::device_friendly_name());
+#else
   root[ESPHOME_F("title")] = linked(App.get_friendly_name().empty() ? App.get_name() : App.get_friendly_name());
+#endif
   char comment_buffer[Application::ESPHOME_COMMENT_SIZE_MAX];
   App.get_comment_string(comment_buffer);
   root[ESPHOME_F("comment")] = static_cast<const char *>(comment_buffer);
@@ -409,7 +427,11 @@ json::SerializationBuffer<> WebServer::get_config_json() {
 }
 
 void WebServer::setup() {
+  global_entity_settings.load();
   this->base_->init();
+#ifdef USE_ESP32
+  App.add_on_entities_changed_callback([this]() { this->defer("relist", [this]() { this->events_.relist(); }); });
+#endif
 
 #ifdef USE_LOGGER
   if (logger::global_logger != nullptr && this->expose_log_) {
@@ -547,7 +569,11 @@ void WebServer::handle_pna_cors_request(AsyncWebServerRequest *request) {
   // Echo the specific origin back so the response is valid even when auth (credentials) is enabled.
   response->addHeader(ESPHOME_F("Access-Control-Allow-Origin"), has_origin ? origin : "*");
   response->addHeader(ESPHOME_F("Access-Control-Allow-Private-Network"), ESPHOME_F("true"));
+#ifdef USE_NETWORK
+  response->addHeader(ESPHOME_F("Private-Network-Access-Name"), network::device_name().c_str());
+#else
   response->addHeader(ESPHOME_F("Private-Network-Access-Name"), App.get_name().c_str());
+#endif
   char mac_s[MAC_ADDRESS_PRETTY_BUFFER_SIZE];
   response->addHeader(ESPHOME_F("Private-Network-Access-ID"), get_mac_address_pretty_into_buffer(mac_s));
   request->send(response);
@@ -619,7 +645,12 @@ static void set_json_id(JsonObject root, EntityBase *obj, ProgmemStr prefix, Jso
     root[ESPHOME_F("name")] = name;  // in id_buf on the stack, so copied
 #else
     const StringRef &ram_name = obj->get_name_progmem().ram_ref();
+#ifdef USE_RUNTIME_LANGUAGE
+    const char *shown = runtime_language::tr(ram_name.c_str());
+    root[ESPHOME_F("name")] = linked(shown, strlen(shown));
+#else
     root[ESPHOME_F("name")] = linked(ram_name.c_str(), ram_name.size());
+#endif
 #endif
 #ifdef USE_DEVICES
     if (device_name) {
@@ -657,7 +688,8 @@ static void set_json_icon_state_value(JsonObject root, EntityBase *obj, ProgmemS
 }
 
 void WebServer::send_state_event_(void *source, const EntityBase *entity, message_generator_t *generator) {
-  if (!entity->is_internal() || this->include_internal_)
+  if ((!entity->is_internal() || this->include_internal_) &&
+      (global_entity_settings.off(entity) & ENTITY_WEB_OFF) == 0)
     this->events_.deferrable_send_state(source, false, generator);
 }
 
@@ -1448,12 +1480,21 @@ void WebServer::select_json_(select::Select *obj, StringRef value, JsonDetail st
 
   const JsonString state = linked(value);
   set_json_icon_state_value(root, obj, ESPHOME_F("select"), state, state, start_config);
+  const auto &traits = obj->traits;
+  root[ESPHOME_F("orev")] = traits.get_options_revision();
   if (start_config == DETAIL_ALL) {
     JsonArray opt = root[ESPHOME_F("option")].to<JsonArray>();
-    for (auto &option : obj->traits.get_options()) {
+    for (auto &option : traits.get_options()) {
       opt.add(linked(option));
     }
     this->add_sorting_info_(root, obj);
+  } else if (traits.get_last_change() != select::SelectOptionsChange::REPLACED) {
+    // The change that led to orev, for a client holding the revision before it; any other gap refetches the list
+    JsonObject op = root[ESPHOME_F("option_op")].to<JsonObject>();
+    const size_t index = traits.get_last_change_index();
+    op[ESPHOME_F("i")] = index;
+    if (traits.get_last_change() != select::SelectOptionsChange::REMOVED)
+      op[ESPHOME_F("v")] = linked(traits.get_options()[index]);
   }
 }
 #endif
@@ -2547,6 +2588,12 @@ void WebServer::handleRequest(AsyncWebServerRequest *request) {
 bool WebServer::isRequestHandlerTrivial() const { return false; }
 
 void WebServer::add_sorting_info_(JsonObject &root, EntityBase *entity) {
+  const uint8_t group = global_entity_settings.web_group(entity);
+  const int index = group != EntitySettings::GROUP_DEFAULT ? global_entity_settings.group_index(group) : -1;
+  if (index >= 0) {
+    root[ESPHOME_F("sorting_group")] = global_entity_settings.group_name(index);
+    return;
+  }
 #ifdef USE_WEBSERVER_SORTING
   if (this->sorting_entities_.contains(entity)) {
     root[ESPHOME_F("sorting_weight")] = this->sorting_entities_[entity].weight;
@@ -2560,6 +2607,11 @@ void WebServer::add_sorting_info_(JsonObject &root, EntityBase *entity) {
 #ifdef USE_WEBSERVER_SORTING
 void WebServer::add_entity_config(EntityBase *entity, float weight, uint64_t group) {
   this->sorting_entities_[entity] = SortingComponents{weight, group};
+  note_registration(&WebServer::remove_entity_config_, this, entity, nullptr);
+}
+
+void WebServer::remove_entity_config_(void *server, void *entity, void *unused) {
+  static_cast<WebServer *>(server)->sorting_entities_.erase(static_cast<EntityBase *>(entity));
 }
 
 void WebServer::add_sorting_group(uint64_t group_id, const std::string &group_name, float weight) {
