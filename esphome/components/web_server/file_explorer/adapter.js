@@ -1390,6 +1390,46 @@
   var card = null;
   var frameEl = null;
   var feInstance = null;
+  var tabState = { built: null, log: null, extras: [], pending: [] };
+
+  function selectTab(id) {
+    var t = tabState.built;
+    if (!t) return;
+    t.frame.style.display = id === 'files' ? '' : 'none';
+    if (tabState.log) tabState.log.style.display = id === 'log' ? '' : 'none';
+    t.filesTab.classList.toggle('esph-fe-tab--active', id === 'files');
+    t.logTab.classList.toggle('esph-fe-tab--active', id === 'log');
+    tabState.extras.forEach(function (x) {
+      x.panel.style.display = x.id === id ? '' : 'none';
+      x.tab.classList.toggle('esph-fe-tab--active', x.id === id);
+    });
+    if (id === 'files' && feInstance) feInstance.RefreshFolders(true);
+  }
+
+  function addTab(id, title, element) {
+    var t = tabState.built;
+    if (!t) {
+      tabState.pending.push([id, title, element]);
+      return true;
+    }
+    var tab = document.createElement('div');
+    tab.className = 'esph-fe-tab';
+    tab.textContent = title;
+    tab.addEventListener('dblclick', t.widen);
+    tab.addEventListener('click', function () {
+      selectTab(id);
+    });
+    t.tabbar.appendChild(tab);
+    var panel = document.createElement('div');
+    panel.className = 'esph-fe-frame';
+    panel.style.display = 'none';
+    panel.appendChild(element);
+    t.card.appendChild(panel);
+    tabState.extras.push({ id: id, tab: tab, panel: panel });
+    return true;
+  }
+
+  window.ESPHFE_TABS = { add: addTab };
 
   // The v3 page frames each section as a tab header over a rounded container. The browser is
   // another such section, so it builds the same two elements rather than sitting in the page
@@ -1441,7 +1481,7 @@
 
     el.appendChild(tabbar);
     el.appendChild(frame);
-    return { card: el, host: host, logTab: logTab, filesTab: filesTab, frame: frame };
+    return { card: el, host: host, logTab: logTab, filesTab: filesTab, frame: frame, tabbar: tabbar, widen: widen };
   }
 
   // Places the card directly below the entity table — above the log, which grows. The v3 app
@@ -1493,29 +1533,20 @@
   // Switch between the log and the browser. Files hides esp-log entirely (so its growth cannot
   // push anything), Log hides the browser frame. With no log present the browser is always on.
   function wireTabs(tabs, log) {
+    tabState.log = log;
+    tabs.filesTab.addEventListener('click', function () {
+      selectTab('files');
+    });
     if (!log) {
-      tabs.frame.style.display = '';
       tabs.logTab.style.display = 'none';
-      tabs.filesTab.classList.add('esph-fe-tab--active');
+      selectTab('files');
       return;
     }
     hideLogHeader(log, 0);
-    function select(files) {
-      tabs.frame.style.display = files ? '' : 'none';
-      log.style.display = files ? 'none' : '';
-      tabs.filesTab.classList.toggle('esph-fe-tab--active', files);
-      tabs.logTab.classList.toggle('esph-fe-tab--active', !files);
-      // The widget may have first rendered while hidden; refresh on show so the listing is
-      // current and laid out against the now-visible frame.
-      if (files && feInstance) feInstance.RefreshFolders(true);
-    }
     tabs.logTab.addEventListener('click', function () {
-      select(false);
+      selectTab('log');
     });
-    tabs.filesTab.addEventListener('click', function () {
-      select(true);
-    });
-    select(false);  // default: Log
+    selectTab('log');
   }
 
   // ---------------------------------------------------------------------------
@@ -1526,6 +1557,10 @@
     var built = buildCard();
     card = built.card;
     frameEl = built.frame;
+    tabState.built = built;
+    tabState.pending.splice(0).forEach(function (p) {
+      addTab(p[0], p[1], p[2]);
+    });
     attach(card, built);
     // The access rights decide which callbacks are defined at all — the widget only shows a
     // rename affordance when onrename exists, so a read-only node gets a read-only browser

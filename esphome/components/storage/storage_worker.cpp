@@ -137,9 +137,9 @@ bool StorageWorker::is_task_safe_(const TransferRequest &req) const {
   // network driver that reports STORAGE_CAP_IO_TASK_SAFE is asserting that its mount path
   // (resolve/connect/TLS, i.e. its socket and lwip use) is safe to run from this background task;
   // the worker takes that at face value, as it does for every other task-routed call.
-  if (req.op == RequestOp::FORMAT)
+  if (uses_target_(req.op))
     return (req.format_target->get_capabilities() & StorageCaps::STORAGE_CAP_IO_TASK_SAFE) != 0;
-  if (req.op == RequestOp::MOUNT || req.op == RequestOp::LIST_DIR)
+  if (path_control_(req.op))
     return (req.dst_storage->get_capabilities() & StorageCaps::STORAGE_CAP_IO_TASK_SAFE) != 0;
   // Every storage this op touches must be task-safe, or a background task would race the main
   // loop on it. A copy/move touches src_storage AND dst_storage (both non-null, no raw_device).
@@ -229,6 +229,10 @@ static bool touches(const Storage *side, const Storage *s) {
   return side != nullptr && s != nullptr && (side == s || side->get_backing_storage() == s);
 }
 
+#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
+void notify_direct(StreamRequest &req);
+#endif
+
 bool StorageWorker::overlaps_active_(const TransferRequest &candidate) const {
   for (const auto &req : this->pool_) {
     if (&req == &candidate)
@@ -236,11 +240,18 @@ bool StorageWorker::overlaps_active_(const TransferRequest &candidate) const {
     RequestState state = req.state.load();
     if (state != RequestState::RUNNING && state != RequestState::CANCELLED)
       continue;
+    if (req.op == RequestOp::KV_BATCH || candidate.op == RequestOp::KV_BATCH || req.op == RequestOp::KV_READ ||
+        candidate.op == RequestOp::KV_READ) {
+      if ((req.op == RequestOp::FORMAT || candidate.op == RequestOp::FORMAT) &&
+          req.format_target == candidate.format_target)
+        return true;
+      continue;
+    }
     // Null sides (raw ops carry only one path-storage side) must not match other nulls.
     // A FORMAT's target rides in format_target (may be Raw/KV); consult it only when the op is
     // FORMAT, so it serializes against any active op on the same storage, and vice versa.
-    storage::Storage *req_fmt = req.op == RequestOp::FORMAT ? req.format_target : nullptr;
-    storage::Storage *cand_fmt = candidate.op == RequestOp::FORMAT ? candidate.format_target : nullptr;
+    storage::Storage *req_fmt = uses_target_(req.op) ? req.format_target : nullptr;
+    storage::Storage *cand_fmt = uses_target_(candidate.op) ? candidate.format_target : nullptr;
     if (same_medium(req.src_storage, candidate.src_storage) || same_medium(req.src_storage, candidate.dst_storage) ||
         same_medium(req.dst_storage, candidate.src_storage) || same_medium(req.dst_storage, candidate.dst_storage) ||
         (req.raw_device != nullptr && req.raw_device == candidate.raw_device) ||
@@ -406,6 +417,7 @@ StorageError StorageWorker::submit_(RequestOp op, PathStorage *src, const char *
   // otherwise overlaps_active_() sees a stale raw_device on this plain copy/move and
   // serializes unrelated transfers against it -- up to blocking them indefinitely.
   slot->raw_device = nullptr;
+  slot->raw_data = nullptr;
   slot->raw_address = 0;
   slot->raw_erase_pos = 0;
   slot->raw_erase_end = 0;
@@ -499,13 +511,14 @@ StorageError StorageWorker::async_raw_erase(RawStorage *device, uint64_t address
 
 StorageError StorageWorker::submit_control_op_(RequestOp op, Storage *target, CompletionCallback &&on_done,
                                                TransferJob *job_out, const char *path,
-                                               bool (*list_entry)(const FileStat *, void *), void *list_ctx) {
+                                               bool (*list_entry)(const FileStat *, void *), void *list_ctx,
+                                               const char *src_path, const uint8_t *data, uint64_t count) {
   // After mark_failed() (no registry -> the drain contract cannot hold) update() never runs,
   // so a queued request would never complete. Reject up front so callers chaining on the
   // completion learn the worker is unusable instead of hanging forever.
   if (this->is_failed())
     return StorageError::STORAGE_ERROR_NOT_READY;
-  if (strlen(path) >= STORAGE_WORKER_MAX_PATH)
+  if (strlen(path) >= STORAGE_WORKER_MAX_PATH || strlen(src_path) >= STORAGE_WORKER_MAX_PATH)
     return StorageError::STORAGE_ERROR_INVALID_ARGS;
   this->ensure_started_();
   TransferRequest *slot = nullptr;
@@ -524,14 +537,15 @@ StorageError StorageWorker::submit_control_op_(RequestOp op, Storage *target, Co
   // (not a PathStorage), so it rides in format_target instead; those same mechanisms consult it via
   // the op == FORMAT gate. src is null and no handle is ever opened.
   slot->src_storage = nullptr;
-  slot->dst_storage = op == RequestOp::FORMAT ? nullptr : static_cast<PathStorage *>(target);
-  slot->format_target = op == RequestOp::FORMAT ? target : nullptr;
-  slot->src_path[0] = '\0';
+  slot->dst_storage = uses_target_(op) ? nullptr : static_cast<PathStorage *>(target);
+  slot->format_target = uses_target_(op) ? target : nullptr;
+  strcpy(slot->src_path, src_path);
   strcpy(slot->dst_path, path);  // LIST_DIR's directory; "" for the others
   slot->list_entry = list_entry;
   slot->list_ctx = list_ctx;
   slot->raw_device = nullptr;
-  slot->raw_address = 0;
+  slot->raw_data = data;
+  slot->raw_address = count;
   slot->raw_erase_pos = 0;
   slot->raw_erase_end = 0;
   slot->force_sliced_erase = false;
@@ -612,10 +626,71 @@ StorageError StorageWorker::async_list_dir(PathStorage *target, const char *path
   return this->submit_control_op_(RequestOp::LIST_DIR, target, std::move(on_done), job_out, path, entry, ctx);
 }
 
+StorageError StorageWorker::async_raw_write_buffer(RawStorage *device, uint64_t address, const uint8_t *data,
+                                                   size_t len, bool erase_first, CompletionCallback &&on_done,
+                                                   TransferJob *job_out) {
+  if (device == nullptr || data == nullptr || len == 0)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_raw_(RequestOp::RAW_WRITE_BUFFER, device, address, len, nullptr, "", erase_first, false,
+                           std::move(on_done), job_out, false, 0, data);
+}
+
+StorageError StorageWorker::async_kv_batch(KeyValueStorage *target, const char *ns, const KvItem *items, size_t count,
+                                           CompletionCallback &&on_done, TransferJob *job_out) {
+  if (target == nullptr || ns == nullptr || items == nullptr || count == 0)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::KV_BATCH, target, std::move(on_done), job_out, "", nullptr, nullptr, ns,
+                                  reinterpret_cast<const uint8_t *>(items), count);
+}
+
+StorageError StorageWorker::async_kv_read(KeyValueStorage *target, const char *ns, KvRead *items, size_t count,
+                                          CompletionCallback &&on_done, TransferJob *job_out) {
+  if (target == nullptr || ns == nullptr || items == nullptr || count == 0)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::KV_READ, target, std::move(on_done), job_out, "", nullptr, nullptr, ns,
+                                  reinterpret_cast<const uint8_t *>(items), count);
+}
+
+StorageError StorageWorker::async_mkdir(PathStorage *target, const char *path, CompletionCallback &&on_done,
+                                        TransferJob *job_out) {
+  if (target == nullptr || path == nullptr || path[0] == '\0')
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::MKDIR, target, std::move(on_done), job_out, path);
+}
+
+StorageError StorageWorker::async_rename(PathStorage *target, const char *from, const char *to,
+                                         CompletionCallback &&on_done, TransferJob *job_out) {
+  if (target == nullptr || from == nullptr || to == nullptr || from[0] == '\0' || to[0] == '\0')
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::RENAME, target, std::move(on_done), job_out, to, nullptr, nullptr, from);
+}
+
+StorageError StorageWorker::async_stat(PathStorage *target, const char *path, FileStat *out,
+                                       CompletionCallback &&on_done, TransferJob *job_out) {
+  if (target == nullptr || path == nullptr || out == nullptr)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::STAT, target, std::move(on_done), job_out, path, nullptr, out);
+}
+
+StorageError StorageWorker::async_get_info(PathStorage *target, StorageInfo *out, CompletionCallback &&on_done,
+                                           TransferJob *job_out) {
+  if (target == nullptr || out == nullptr)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::GET_INFO, target, std::move(on_done), job_out, "", nullptr, out);
+}
+
+StorageError StorageWorker::async_remove(PathStorage *target, const char *path, CompletionCallback &&on_done,
+                                         TransferJob *job_out, bool recursive) {
+  if (target == nullptr || path == nullptr || path[0] == '\0')
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->submit_control_op_(RequestOp::REMOVE, target, std::move(on_done), job_out, path, nullptr, nullptr, "",
+                                  nullptr, recursive ? 1 : 0);
+}
+
 StorageError StorageWorker::submit_raw_(RequestOp op, RawStorage *device, uint64_t address, uint64_t size,
                                         PathStorage *file_side, const char *file_path, bool erase_first, bool overwrite,
                                         CompletionCallback &&on_done, TransferJob *job_out, bool force_sliced,
-                                        uint8_t verify_passes) {
+                                        uint8_t verify_passes, const uint8_t *data) {
   // After mark_failed() (no registry -> the drain contract cannot hold) update() never runs,
   // so a queued request would never complete. Reject up front so callers chaining on the
   // completion learn the worker is unusable instead of hanging forever.
@@ -644,6 +719,7 @@ StorageError StorageWorker::submit_raw_(RequestOp op, RawStorage *device, uint64
   (file_is_src ? slot->src_path : slot->dst_path)[STORAGE_WORKER_MAX_PATH - 1] = '\0';
   (file_is_src ? slot->dst_path : slot->src_path)[0] = '\0';
   slot->raw_device = device;
+  slot->raw_data = data;
   slot->raw_address = address;
   slot->raw_erase_pos = 0;
   slot->raw_erase_end = erase_first ? 1 : 0;  // pre-phase converts to a real byte range
@@ -762,7 +838,7 @@ bool StorageWorker::get_transfer_status(TransferJob job, TransferStatus *out) co
       out->verify_pass = static_cast<uint8_t>(req.verify_pass_done + 1);
     } else if (req.raw_erase_pos < req.raw_erase_end) {
       out->phase = TransferPhase::ERASE;
-    } else if (req.op == RequestOp::RAW_WRITE_FROM_FILE) {
+    } else if (req.op == RequestOp::RAW_WRITE_FROM_FILE || req.op == RequestOp::RAW_WRITE_BUFFER) {
       out->phase = TransferPhase::WRITE;
     }
   }
@@ -793,7 +869,7 @@ void StorageWorker::on_storage_unregistered_(Storage *s) {
   for (size_t i = 0; i < this->pool_.size(); i++) {
     TransferRequest &req = this->pool_[i];
     if (!touches(req.src_storage, s) && !touches(req.dst_storage, s) && req.raw_device != s &&
-        (req.op != RequestOp::FORMAT || req.format_target != s))
+        (!uses_target_(req.op) || req.format_target != s))
       continue;
 
     RequestState state = req.state.load();
@@ -980,6 +1056,11 @@ void StorageWorker::deliver_completions_() {
           ESP_LOGW(TAG, "change feed skipped: path too long for USE_STORAGE_VFS_PATH_MAX (mount root)");
         }
         global_storage_registry->note_dir_changed("");
+      } else if (global_storage_registry != nullptr && req.dst_storage != nullptr &&
+                 (req.op == RequestOp::REMOVE || req.op == RequestOp::MKDIR || req.op == RequestOp::RENAME) &&
+                 req.result == StorageError::STORAGE_ERROR_OK) {
+        if (StorageRegistry::build_path(req.dst_storage, req.dst_path, feed_path, sizeof(feed_path)))
+          global_storage_registry->note_parent_changed(feed_path);
       }
 #endif
       CompletionCallback cb = std::move(req.callback);
@@ -1028,6 +1109,21 @@ void StorageWorker::update() {
 
   this->deliver_completions_();
 
+#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
+  for (size_t i = 0; i < this->pool_.size(); i++) {
+    TransferRequest &candidate = this->pool_[i];
+    if (candidate.state.load() != RequestState::PENDING || !this->is_task_safe_(candidate) ||
+        this->overlaps_active_(candidate))
+      continue;
+    QueueEntry entry{QueueEntryKind::TRANSFER, i};
+    candidate.task_started_.store(false);
+    candidate.last_progress_ms = millis();
+    candidate.state = RequestState::RUNNING;
+    if (xQueueSend(this->task_queue_, &entry, 0) != pdTRUE)
+      candidate.state = RequestState::PENDING;
+  }
+#endif
+
   if (this->loop_active_index_ == SIZE_MAX) {
     // Pick the next PENDING request, FIFO by pool position (pool order matches submission
     // order well enough in practice -- this component makes no stronger ordering promise).
@@ -1037,6 +1133,10 @@ void StorageWorker::update() {
       TransferRequest &candidate = this->pool_[i];
       if (candidate.state.load() != RequestState::PENDING)
         continue;
+#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
+      if (this->is_task_safe_(candidate))
+        continue;
+#endif
       if (this->overlaps_active_(candidate)) {
         // Known limitation: if the overlapping request is stuck (its engine never reached DONE
         // after a drain timeout -- see on_storage_unregistered_()), this one waits forever and its
@@ -1116,6 +1216,10 @@ void StorageWorker::update() {
     }
 
     StreamState state = req.state.load();
+#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
+    if (req.direct_waiter.load() != nullptr && state != StreamState::READING && state != StreamState::WRITING)
+      notify_direct(req);
+#endif
     bool step_done = (state == StreamState::IDLE && req.callback) || state == StreamState::DONE;
     if (!step_done)
       continue;
@@ -1169,7 +1273,12 @@ void StorageWorker::task_loop_() {
       // STREAM: single step per queue entry, unlike TransferRequest above -- the caller submits
       // exactly one queue entry per write_chunk()/read_chunk()/begin_*()/end_*() call, so there
       // is no "loop until DONE" here; DONE only happens on end_write()/end_read()'s step.
-      this->run_stream_step_(this->stream_pool_[entry.index]);
+      StreamRequest &sreq = this->stream_pool_[entry.index];
+      this->run_stream_step_(sreq);
+      if (sreq.direct_waiter.load() != nullptr) {
+        notify_direct(sreq);
+        continue;
+      }
     }
     // DONE (or IDLE, for streams) reached, and this task is the producer: loop() delivers the
     // completion, but its component phase is gated (loop_interval_, high-frequency request, or an
@@ -1330,6 +1439,56 @@ void StorageWorker::verify_chunk_(TransferRequest &req, bool on_task) {
 // One step of a directory walk. Everything here is control plane -- list, mkdir, rmdir, remove --
 // so it costs one call each and never blocks for long; the bytes go through run_chunk_()'s
 // chunk loop exactly as they do for a single file. Returns false once the request is finished.
+void StorageWorker::run_raw_buffer_chunk_(TransferRequest &req) {
+  RawGeometry geo{};
+  req.raw_device->get_raw_geometry(&geo);
+  const uint64_t total = req.bytes_total.load();
+  if (!req.pre_phase_done) {
+    req.pre_phase_done = true;
+    if (req.raw_data == nullptr || total == 0 || req.raw_address >= geo.capacity ||
+        total > geo.capacity - req.raw_address) {
+      finish_request(req, StorageError::STORAGE_ERROR_INVALID_ARGS);
+      return;
+    }
+    if (req.raw_erase_end != 0) {
+      if (geo.erase_sector == 0 || (req.raw_address % geo.erase_sector) != 0) {
+        finish_request(req, StorageError::STORAGE_ERROR_INVALID_ARGS);
+        return;
+      }
+      uint64_t len = total;
+      if ((len % geo.erase_sector) != 0)
+        len += geo.erase_sector - (len % geo.erase_sector);
+      req.raw_erase_pos = req.raw_address;
+      req.raw_erase_end = req.raw_address + len;
+    }
+  }
+  if (req.offset >= total) {
+    finish_request(req, StorageError::STORAGE_ERROR_OK);
+    return;
+  }
+  const uint64_t unit = geo.erase_sector != 0 ? geo.erase_sector : STORAGE_COPY_CHUNK_SIZE;
+  const size_t step = static_cast<size_t>(std::min<uint64_t>(unit, total - req.offset));
+  const uint64_t at = req.raw_address + req.offset;
+  while (req.raw_erase_pos < req.raw_erase_end && req.raw_erase_pos < at + step) {
+    const StorageError eerr = req.raw_device->erase(req.raw_erase_pos, geo.erase_sector);
+    if (eerr != StorageError::STORAGE_ERROR_OK) {
+      finish_request(req, eerr);
+      return;
+    }
+    req.raw_erase_pos += geo.erase_sector;
+  }
+  size_t written = 0;
+  const StorageError werr = req.raw_device->write(at, req.raw_data + req.offset, step, &written);
+  if (werr != StorageError::STORAGE_ERROR_OK || written == 0) {
+    finish_request(req, werr != StorageError::STORAGE_ERROR_OK ? werr : StorageError::STORAGE_ERROR_WRITE_ERROR);
+    return;
+  }
+  req.offset += written;
+  req.bytes_done.store(req.offset);
+  if (req.offset >= total)
+    finish_request(req, StorageError::STORAGE_ERROR_OK);
+}
+
 void StorageWorker::run_raw_chunk_(TransferRequest &req, bool on_task) {
   const bool to_file = req.op == RequestOp::RAW_READ_TO_FILE;
   PathStorage *file_storage = to_file ? req.dst_storage : req.src_storage;
@@ -1997,6 +2156,47 @@ void StorageWorker::run_chunk_(TransferRequest &req, bool on_task) {
     finish_request(req, static_cast<PathStorage *>(req.dst_storage)->list_dir(req.dst_path, req.list_entry, req.list_ctx));
     return;
   }
+  if (req.op == RequestOp::REMOVE) {
+    auto *ps = static_cast<PathStorage *>(req.dst_storage);
+    FileStat info{};
+    StorageError err = ps->stat(req.dst_path, &info);
+    if (err == StorageError::STORAGE_ERROR_OK)
+      err = info.is_dir && req.raw_address != 0 ? remove_recursive(ps, req.dst_path) : ps->remove(req.dst_path);
+    finish_request(req, err);
+    return;
+  }
+  if (req.op == RequestOp::STAT) {
+    finish_request(req, static_cast<PathStorage *>(req.dst_storage)->stat(req.dst_path, static_cast<FileStat *>(req.list_ctx)));
+    return;
+  }
+  if (req.op == RequestOp::GET_INFO) {
+    finish_request(req, static_cast<PathStorage *>(req.dst_storage)->get_info(static_cast<StorageInfo *>(req.list_ctx)));
+    return;
+  }
+  if (req.op == RequestOp::MKDIR) {
+    finish_request(req, static_cast<PathStorage *>(req.dst_storage)->mkdir(req.dst_path));
+    return;
+  }
+  if (req.op == RequestOp::RENAME) {
+    finish_request(req, static_cast<PathStorage *>(req.dst_storage)->rename(req.src_path, req.dst_path));
+    return;
+  }
+  if (req.op == RequestOp::KV_BATCH) {
+    finish_request(req, static_cast<KeyValueStorage *>(req.format_target)
+                            ->set_batch(req.src_path, reinterpret_cast<const KvItem *>(req.raw_data),
+                                        static_cast<size_t>(req.raw_address)));
+    return;
+  }
+  if (req.op == RequestOp::KV_READ) {
+    finish_request(req, static_cast<KeyValueStorage *>(req.format_target)
+                            ->get_batch(req.src_path, const_cast<KvRead *>(reinterpret_cast<const KvRead *>(req.raw_data)),
+                                        static_cast<size_t>(req.raw_address)));
+    return;
+  }
+  if (req.op == RequestOp::RAW_WRITE_BUFFER) {
+    this->run_raw_buffer_chunk_(req);
+    return;
+  }
   if (req.op == RequestOp::RAW_READ_TO_FILE || req.op == RequestOp::RAW_WRITE_FROM_FILE ||
       req.op == RequestOp::RAW_ERASE || req.op == RequestOp::RAW_VERIFY_FILE) {
     this->run_raw_chunk_(req, on_task);
@@ -2340,7 +2540,9 @@ static void run_stream_step(StreamRequest &req) {
   switch (current) {
     case StreamState::OPENING: {
       if (req.is_fs) {
-        OpenMode mode = req.op == StreamOp::WRITE ? OpenMode::OPEN_MODE_WRITE : OpenMode::OPEN_MODE_READ;
+        OpenMode mode = req.op == StreamOp::WRITE    ? OpenMode::OPEN_MODE_WRITE
+                        : req.op == StreamOp::UPDATE ? OpenMode::OPEN_MODE_READ_WRITE
+                                                     : OpenMode::OPEN_MODE_READ;
         err = static_cast<FilesystemStorage *>(req.storage)->open(req.path, req.handle, mode);
       } else if (req.op == StreamOp::WRITE) {
         // Same reason as the copy path: a write stream to a NetworkStorage has no open() to
@@ -2577,8 +2779,18 @@ StorageError StorageWorker::begin_write(PathStorage *storage, const char *path, 
   return StorageError::STORAGE_ERROR_OK;
 }
 
+StorageError StorageWorker::begin_update(PathStorage *storage, const char *path, StreamHandle *out_handle,
+                                         CompletionCallback &&on_open) {
+  return this->begin_stream_(StreamOp::UPDATE, storage, path, out_handle, std::move(on_open));
+}
+
 StorageError StorageWorker::begin_read(PathStorage *storage, const char *path, StreamHandle *out_handle,
                                        CompletionCallback &&on_open) {
+  return this->begin_stream_(StreamOp::READ, storage, path, out_handle, std::move(on_open));
+}
+
+StorageError StorageWorker::begin_stream_(StreamOp op, PathStorage *storage, const char *path,
+                                          StreamHandle *out_handle, CompletionCallback &&on_open) {
   // After mark_failed() (no registry -> the drain contract cannot hold) update() never runs, so a
   // queued request would never complete. Reject up front so a caller chaining on on_open learns the
   // worker is unusable instead of hanging forever with a claimed slot.
@@ -2593,7 +2805,7 @@ StorageError StorageWorker::begin_read(PathStorage *storage, const char *path, S
     return StorageError::STORAGE_ERROR_NOT_READY;
 
   StreamRequest &req = this->stream_pool_[index];
-  req.op = StreamOp::READ;
+  req.op = op;
   req.storage = storage;
   strncpy(req.path, path, STORAGE_WORKER_MAX_PATH - 1);
   req.path[STORAGE_WORKER_MAX_PATH - 1] = '\0';
@@ -2660,6 +2872,63 @@ StorageError StorageWorker::read_chunk(const StreamHandle &handle, uint8_t *buf,
   this->dispatch_stream_step_(req, handle.index);
   return StorageError::STORAGE_ERROR_OK;
 }
+
+#if defined(USE_ESP32) && defined(USE_STORAGE_WORKER_TASK)
+void notify_direct(StreamRequest &req) {
+  TaskHandle_t waiter = req.direct_waiter.exchange(nullptr);
+  if (waiter == nullptr)
+    return;
+  if (req.direct_result != nullptr)
+    *req.direct_result = req.result;
+  req.direct_result = nullptr;
+  xTaskNotifyGive(waiter);
+}
+
+StorageError StorageWorker::chunk_direct_(StreamRequest &req, size_t index, StreamState step, uint8_t *read_buf,
+                                          const uint8_t *write_data, size_t len, size_t *bytes_read,
+                                          storage::StorageError *result, TaskHandle_t waiter) {
+  if (req.callback || req.direct_waiter.load() != nullptr)
+    return StorageError::STORAGE_ERROR_NOT_READY;
+  if (this->task_queue_ == nullptr || !this->is_task_safe_(req) || this->stream_overlaps_active_(req, false))
+    return StorageError::STORAGE_ERROR_NOT_SUPPORTED;
+  StreamState expected = StreamState::IDLE;
+  if (!req.state.compare_exchange_strong(expected, step))
+    return StorageError::STORAGE_ERROR_NOT_READY;
+  req.pending_read_buf = read_buf;
+  req.pending_write_data = write_data;
+  req.pending_len = len;
+  req.bytes_transferred_out = bytes_read;
+  req.direct_result = result;
+  req.step_started_.store(false);
+  req.direct_waiter.store(waiter);
+  QueueEntry entry{QueueEntryKind::STREAM, index};
+  if (xQueueSend(this->task_queue_, &entry, 0) == pdTRUE)
+    return StorageError::STORAGE_ERROR_OK;
+  req.direct_waiter.store(nullptr);
+  req.direct_result = nullptr;
+  req.pending_write_data = nullptr;
+  req.pending_read_buf = nullptr;
+  req.pending_len = 0;
+  req.state = StreamState::IDLE;
+  return StorageError::STORAGE_ERROR_NOT_READY;
+}
+
+StorageError StorageWorker::read_chunk_direct(const StreamHandle &handle, uint8_t *buf, size_t len, size_t *bytes_read,
+                                              storage::StorageError *result, TaskHandle_t waiter) {
+  StreamRequest *slot = this->stream_for_handle_(handle);
+  if (slot == nullptr || result == nullptr || waiter == nullptr)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->chunk_direct_(*slot, handle.index, StreamState::READING, buf, nullptr, len, bytes_read, result, waiter);
+}
+
+StorageError StorageWorker::write_chunk_direct(const StreamHandle &handle, const uint8_t *data, size_t len,
+                                               storage::StorageError *result, TaskHandle_t waiter) {
+  StreamRequest *slot = this->stream_for_handle_(handle);
+  if (slot == nullptr || result == nullptr || waiter == nullptr)
+    return StorageError::STORAGE_ERROR_INVALID_ARGS;
+  return this->chunk_direct_(*slot, handle.index, StreamState::WRITING, nullptr, data, len, nullptr, result, waiter);
+}
+#endif
 
 StorageError StorageWorker::end_write(const StreamHandle &handle, CompletionCallback &&on_closed) {
   StreamRequest *slot = this->stream_for_handle_(handle);
