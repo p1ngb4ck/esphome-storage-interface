@@ -1524,18 +1524,21 @@ validate_file_system_value = cv.one_of(
 
 
 def _esp32_exfat_enabled(fconf) -> bool:
-    from esphome.components.esp32 import CONF_ENABLE_EXFAT
-    from esphome.components.esp32.const import KEY_ESP32
-    from esphome.const import CONF_ADVANCED, CONF_FRAMEWORK
+    try:
+        from esphome.components.esp32 import CONF_ENABLE_EXFAT
+        from esphome.components.esp32.const import KEY_ESP32
+        from esphome.const import CONF_ADVANCED, CONF_FRAMEWORK
 
-    esp32 = fconf.get(KEY_ESP32)
-    if not esp32:
+        esp32 = fconf.get(KEY_ESP32)
+        if not esp32:
+            return False
+        return bool(
+            esp32.get(CONF_FRAMEWORK, {})
+            .get(CONF_ADVANCED, {})
+            .get(CONF_ENABLE_EXFAT, False)
+        )
+    except (ImportError, AttributeError):
         return False
-    return bool(
-        esp32.get(CONF_FRAMEWORK, {})
-        .get(CONF_ADVANCED, {})
-        .get(CONF_ENABLE_EXFAT, False)
-    )
 
 
 def final_validate_file_system(config) -> None:
