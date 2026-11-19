@@ -258,8 +258,6 @@ class WebServerFileApi : public Component, public AsyncWebHandler {
   // (storage is main-loop-only by contract), queryable through /files/job. Its own id space
   // (see JOB_SPACE_MASK) -- distinct from the directory transfers' as well as the worker's.
   static constexpr uint32_t FLUSH_JOB_FLAG = 0xC0000000u;
-  static constexpr uint32_t JOB_SPACE_MASK = 0xC0000000u;
-  static constexpr uint32_t JOB_COUNTER_MASK = 0x3FFFFFFFu;
   struct StagedFlush {
     bool active{false};
     bool finished{false};
