@@ -3,6 +3,10 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/wake.h"
 
+#ifndef LOOP_TASK_CORE
+static constexpr BaseType_t LOOP_TASK_CORE = tskNO_AFFINITY;
+#endif
+
 #include <cstring>
 #include <new>
 
