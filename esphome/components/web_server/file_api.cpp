@@ -15,6 +15,10 @@
 #include <cinttypes>
 #include <cstring>
 
+#ifndef LOOP_TASK_CORE
+static constexpr BaseType_t LOOP_TASK_CORE = tskNO_AFFINITY;
+#endif
+
 namespace esphome::web_server {
 
 static const char *const TAG = "web_server.file_api";
